@@ -66,21 +66,25 @@ pub enum LostSandbox {
 /// provider environment variables and never belong in this structure.
 #[derive(Clone, Debug, Default)]
 pub struct SandboxOptions {
-    pub backend:           SandboxBackend,
+    pub backend:             SandboxBackend,
+    /// Use the Docker daemon host's network namespace for Docker sandboxes.
+    /// This opt-in requires unrestricted networking and cannot be combined
+    /// with sidecars. It does not apply to Host, Daytona, or other providers.
+    pub docker_host_network: bool,
     /// Network policy for every sandbox created by this run. Providers reject
     /// policies they cannot enforce. Blocked runs also verify attached
     /// sandboxes.
-    pub network:           NetworkPolicy,
+    pub network:             NetworkPolicy,
     /// What to do when a lease's recorded sandbox is gone from the provider.
-    pub lost_sandbox:      LostSandbox,
+    pub lost_sandbox:        LostSandbox,
     /// Label-to-image overrides. Daytona images must include Docker,
     /// `start-docker`, and Python 3. Empty requirements use `ubuntu-24.04`.
-    pub runner_images:     BTreeMap<String, String>,
-    pub daytona_resources: DaytonaResources,
+    pub runner_images:       BTreeMap<String, String>,
+    pub daytona_resources:   DaytonaResources,
     /// The outer Daytona sandbox. Workflow `container:` selects a nested job.
-    pub daytona_kind:      DaytonaSandboxKind,
+    pub daytona_kind:        DaytonaSandboxKind,
     /// `None` leaves development mode to the environment and build profile.
-    pub plugin_dev:        Option<bool>,
+    pub plugin_dev:          Option<bool>,
 }
 
 /// The Daytona offering that hosts a workflow runner.
@@ -248,6 +252,7 @@ mod tests {
             backend: SandboxBackend::Docker,
             ..Default::default()
         };
+        assert!(!options.docker_host_network);
         assert_eq!(
             options.runner_image(&runtime(&["ubuntu-22.04"])).unwrap(),
             format!("ghcr.io/lithoscomputer/ubuntu-22.04:slim-{RUNNER_PIN}")

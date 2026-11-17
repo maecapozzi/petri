@@ -131,10 +131,12 @@ impl SandboxExecutor {
         host_address: Option<String>,
         options: SandboxOptions,
     ) -> Self {
+        let docker_host_network = options.docker_host_network && source.kind() == "docker";
         Self {
             manager: Arc::new(
                 SandboxLeaseManager::new(source, ledger, identity.clone())
-                    .with_lost_sandbox(options.lost_sandbox),
+                    .with_lost_sandbox(options.lost_sandbox)
+                    .with_docker_host_network(docker_host_network),
             ),
             identity,
             retention,
@@ -364,6 +366,8 @@ impl SandboxExecutor {
             return Ok(spec);
         }
         if self.options.backend != SandboxBackend::Daytona {
+            let docker_host_network =
+                self.options.docker_host_network && provider.kind().as_str() == "docker";
             if self.options.backend == SandboxBackend::Docker
                 && matches!(scope.runtime.target, RuntimeTarget::HostProcess)
             {
@@ -373,9 +377,9 @@ impl SandboxExecutor {
                     options:     ContainerOptions::default(),
                     credentials: None,
                 };
-                return build_spec(&runner, labels, name, ctx);
+                return build_spec(&runner, labels, name, ctx, docker_host_network);
             }
-            return build_spec(scope, labels, name, ctx);
+            return build_spec(scope, labels, name, ctx, docker_host_network);
         }
         let image = self.options.runner_image(&scope.runtime)?;
         let snapshot = RunnerSnapshot::new(
@@ -429,6 +433,7 @@ fn build_daytona_spec(
                 registry_auth(credentials.as_ref(), ctx)?,
                 sidecars(scope, ctx)?,
                 options,
+                false,
             );
             // A Daytona job cannot use the local Docker daemon's host alias.
             config.extra_hosts.clear();
@@ -483,6 +488,7 @@ fn build_spec(
     labels: &[(String, String)],
     name: &str,
     ctx: &AcquireContext,
+    docker_host_network: bool,
 ) -> Result<SandboxSpec, EnvError> {
     let RuntimeTarget::Container {
         image,
@@ -499,7 +505,8 @@ fn build_spec(
     };
     let registry_auth = registry_auth(credentials.as_ref(), ctx)?;
     let sidecars = sidecars(scope, ctx)?;
-    let provider_config = docker_provider_config(registry_auth, sidecars, options);
+    let provider_config =
+        docker_provider_config(registry_auth, sidecars, options, docker_host_network);
     let mut spec = SandboxSpec::new(SandboxSource::Image {
         reference: image.to_string(),
     })
@@ -608,12 +615,14 @@ fn docker_provider_config(
     registry_auth: Option<RegistryAuth>,
     sidecars: Vec<Sidecar>,
     container: &ir::ContainerOptions,
+    host_network: bool,
 ) -> DockerProviderConfig {
     // Steps run as a program plus arguments, so an image without bash
     // (alpine) works: the provider's exec wrapper needs only /bin/sh.
     DockerProviderConfig {
         init: true,
         privileged: container.privileged,
+        host_network,
         platform: container.platform.as_ref().map(ToString::to_string),
         extra_hosts: vec![format!("{DOCKER_HOST_ALIAS}:host-gateway")],
         dns: container.dns.iter().map(ToString::to_string).collect(),

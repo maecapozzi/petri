@@ -115,6 +115,7 @@ fn container_jobs_keep_options_services_and_credentials_inside_the_vm() {
     assert_eq!(docker.image, "private/job:pin");
     assert_eq!(docker.user.as_deref(), Some("1000"));
     assert!(docker.options.privileged);
+    assert!(!docker.options.host_network);
     assert!(docker.options.extra_hosts.is_empty());
     assert!(docker.options.binds.is_empty());
     assert_eq!(docker.options.sidecars[0].name, "db");

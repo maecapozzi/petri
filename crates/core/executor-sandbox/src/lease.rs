@@ -262,12 +262,13 @@ pub(crate) struct LeaseRequest<'a> {
 
 /// One live handle and a holder count per lease, over one provider source.
 pub struct SandboxLeaseManager {
-    source:       Arc<dyn ProviderSource>,
-    ledger:       Arc<dyn LeaseLedger>,
-    identity:     Arc<RunIdentity>,
-    lost_sandbox: LostSandbox,
-    leases:       Mutex<HashMap<SandboxLeaseId, Arc<AsyncMutex<LeaseSlot>>>>,
-    cleanup:      Mutex<JoinSet<()>>,
+    source:              Arc<dyn ProviderSource>,
+    ledger:              Arc<dyn LeaseLedger>,
+    identity:            Arc<RunIdentity>,
+    lost_sandbox:        LostSandbox,
+    docker_host_network: bool,
+    leases:              Mutex<HashMap<SandboxLeaseId, Arc<AsyncMutex<LeaseSlot>>>>,
+    cleanup:             Mutex<JoinSet<()>>,
 }
 
 impl SandboxLeaseManager {
@@ -281,6 +282,7 @@ impl SandboxLeaseManager {
             ledger,
             identity,
             lost_sandbox: LostSandbox::Refuse,
+            docker_host_network: false,
             leases: Mutex::new(HashMap::new()),
             cleanup: Mutex::new(JoinSet::new()),
         }
@@ -294,8 +296,23 @@ impl SandboxLeaseManager {
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_docker_host_network(mut self, enabled: bool) -> Self {
+        self.docker_host_network = enabled;
+        self
+    }
+
     pub fn source(&self) -> &Arc<dyn ProviderSource> {
         &self.source
+    }
+
+    fn fingerprint(&self) -> String {
+        let fingerprint = self.source.fingerprint();
+        if self.docker_host_network {
+            format!("{fingerprint}:host-network")
+        } else {
+            fingerprint.to_owned()
+        }
     }
 
     fn slot(&self, lease: SandboxLeaseId) -> Arc<AsyncMutex<LeaseSlot>> {
@@ -469,11 +486,7 @@ impl SandboxLeaseManager {
                     }
                     1 => {
                         self.ledger
-                            .allocating(
-                                request.lease,
-                                self.source.kind(),
-                                self.source.fingerprint(),
-                            )
+                            .allocating(request.lease, self.source.kind(), &self.fingerprint())
                             .await
                             .map_err(|error| Self::ledger_failed(&error))?;
                         self.recover(&*provider, request.lease, &matches[0], None)
@@ -521,7 +534,7 @@ impl SandboxLeaseManager {
         record: &LeaseRecord,
     ) -> Result<(), EnvError> {
         if let Some(recorded) = &record.fingerprint {
-            let current = self.source.fingerprint();
+            let current = self.fingerprint();
             if recorded.as_str() != current {
                 return Err(EnvError::backend(
                     BACKEND,
@@ -529,7 +542,8 @@ impl SandboxLeaseManager {
                     format!(
                         "sandbox lease {lease} was allocated on `{recorded}` but this run is \
                          configured for `{current}`; a changed DOCKER_HOST, Daytona \
-                         organization or target must be restored before the run continues"
+                         organization or target, or Docker network mode must be restored before \
+                         the run continues"
                     ),
                 ));
             }
@@ -562,7 +576,7 @@ impl SandboxLeaseManager {
         let lease = request.lease;
         let standalone = request.standalone;
         self.ledger
-            .allocating(lease, self.source.kind(), self.source.fingerprint())
+            .allocating(lease, self.source.kind(), &self.fingerprint())
             .await
             .map_err(|error| Self::ledger_failed(&error))?;
         let spec = build_spec(labels.to_vec(), provider.clone()).await?;

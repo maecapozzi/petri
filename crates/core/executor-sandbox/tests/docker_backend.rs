@@ -12,7 +12,8 @@ use executor::{
     AcquireContext, EnvError, ExecEnv, Executor, ProcessSpec, Retention, ScopeOutcome, ScopeSpec,
     Sig,
 };
-use executor_sandbox::RoutingExecutor;
+use executor_sandbox::{RoutingExecutor, SandboxBackend, SandboxOptions};
+use sandbox_driver::NetworkPolicy;
 use testkit::{RunDir, container_id, container_is_running, is_docker_ready, list_containers};
 use tokio::time;
 
@@ -488,4 +489,105 @@ async fn a_one_shot_action_container_shares_the_workspace() {
         testkit::list_one_shots(&sandbox_id).await.is_empty(),
         "the sandbox's one-shots went with it"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_network_reaches_docker_and_its_one_shots() {
+    use std::process::Command;
+
+    use executor::OneShotContainer;
+
+    if !is_docker_ready().await {
+        return;
+    }
+    let dir = RunDir::new("sandbox-docker-host-network");
+    let executor = RoutingExecutor::with_options(dir.path(), Retention::Never, SandboxOptions {
+        backend: SandboxBackend::Docker,
+        docker_host_network: true,
+        ..Default::default()
+    })
+    .with_run_id(dir.run_id());
+    let handle = executor
+        .acquire(&container_scope(ALPINE), &AcquireContext::bare())
+        .await
+        .expect("acquire a host-network sandbox");
+    let mode = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.HostConfig.NetworkMode}}",
+            &name(&dir),
+        ])
+        .output()
+        .expect("docker inspect");
+    assert!(mode.status.success());
+    assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "host");
+
+    let (job_namespace, status) = run_bash(&*handle.exec(), "readlink /proc/self/ns/net").await;
+    assert!(status.is_success());
+    let runner = handle.container_runner().expect("one-shot runner");
+    let spec = OneShotContainer::registry(ALPINE)
+        .with_entrypoint("sh")
+        .with_args(&["-c", "readlink /proc/self/ns/net"]);
+    let mut process = runner.run(spec).await.expect("run one-shot");
+    let mut lines = process.lines().expect("lines");
+    let mut one_shot_namespace = Vec::new();
+    while let Some(line) = lines.recv().await {
+        one_shot_namespace.push(line.line);
+    }
+    assert!(process.wait().await.expect("wait").is_success());
+    assert_eq!(
+        one_shot_namespace, job_namespace,
+        "the one-shot shares its owning sandbox's network namespace"
+    );
+
+    let report = executor.release(handle, ScopeOutcome::Succeeded).await;
+    assert!(report.is_clean(), "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_network_rejects_restricted_policies_and_sidecars() {
+    use executor::ServiceSpec;
+
+    if !is_docker_ready().await {
+        return;
+    }
+    for (case, network) in [
+        ("blocked", NetworkPolicy::Block),
+        ("cidr-limited", NetworkPolicy::CidrAllowList {
+            cidrs: vec!["192.0.2.0/24".to_owned()],
+        }),
+    ] {
+        let dir = RunDir::new(&format!("sandbox-docker-host-network-{case}"));
+        let executor =
+            RoutingExecutor::with_options(dir.path(), Retention::Never, SandboxOptions {
+                backend: SandboxBackend::Docker,
+                docker_host_network: true,
+                network,
+                ..Default::default()
+            })
+            .with_run_id(dir.run_id());
+        let error = executor
+            .acquire(&container_scope(ALPINE), &AcquireContext::bare())
+            .await
+            .expect_err("host networking must not weaken a restricted policy");
+        assert!(error.to_string().contains("host networking"), "{error}");
+        assert!(list_containers(&dir.container_prefix()).await.is_empty());
+    }
+
+    let dir = RunDir::new("sandbox-docker-host-network-sidecar");
+    let executor = RoutingExecutor::with_options(dir.path(), Retention::Never, SandboxOptions {
+        backend: SandboxBackend::Docker,
+        docker_host_network: true,
+        ..Default::default()
+    })
+    .with_run_id(dir.run_id());
+    let mut scope = container_scope(ALPINE);
+    scope.services.push(ServiceSpec::new("service", ALPINE));
+    let error = executor
+        .acquire(&scope, &AcquireContext::bare())
+        .await
+        .expect_err("host networking must not remove or admit a sidecar");
+    assert!(error.to_string().contains("host networking"), "{error}");
+    assert!(list_containers(&dir.container_prefix()).await.is_empty());
 }

@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use executor::{
     AcquireContext, EnvError, EnvHandle, Executor, Retention, SandboxLeaseId, ScopeSpec,
+    ServiceSpec,
 };
 use sandbox_driver::{
     Capabilities, Capability, Error, EventContext, Exec, Filesystem, Isolation, NetworkPolicy,
@@ -163,7 +164,7 @@ impl SandboxProvider for FakeProvider {
 }
 
 struct Fixture {
-    _dir:     RunDir,
+    dir:      RunDir,
     executor: Arc<SandboxExecutor>,
     provider: Arc<FakeProvider>,
     ledger:   Arc<MemoryLedger>,
@@ -171,10 +172,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(environment: EnvironmentBehavior) -> Self {
+        Self::for_kind(environment, "docker")
+    }
+
+    fn for_kind(environment: EnvironmentBehavior, kind: &str) -> Self {
         let dir = RunDir::new("sandbox-acquire-cancel");
         let provider = Arc::new(FakeProvider {
             requests:          Mutex::new(Vec::new()),
-            kind:              ProviderKind::try_new("fake")
+            kind:              ProviderKind::try_new(kind)
                 .expect("the test provider kind is valid"),
             sandbox:           Arc::new(FakeSandbox {
                 id: SandboxId::try_new("sandbox-1").expect("the test sandbox id is valid"),
@@ -201,7 +206,7 @@ impl Fixture {
             crate::SandboxOptions::default(),
         ));
         Self {
-            _dir: dir,
+            dir,
             executor,
             provider,
             ledger,
@@ -209,12 +214,14 @@ impl Fixture {
     }
 
     fn acquire(&self) -> JoinHandle<Result<EnvHandle, EnvError>> {
+        let scope = ScopeSpec::new(ir::ScopeId::new(0), "scope-0")
+            .with_runtime(ir::RuntimeSpec::container("test-image"));
+        self.acquire_scope(scope)
+    }
+
+    fn acquire_scope(&self, scope: ScopeSpec) -> JoinHandle<Result<EnvHandle, EnvError>> {
         let executor = self.executor.clone();
-        tokio::spawn(async move {
-            let scope = ScopeSpec::new(ir::ScopeId::new(0), "scope-0")
-                .with_runtime(ir::RuntimeSpec::container("test-image"));
-            executor.acquire(&scope, &AcquireContext::bare()).await
-        })
+        tokio::spawn(async move { executor.acquire(&scope, &AcquireContext::bare()).await })
     }
 
     async fn assert_deleted(&self) {
@@ -344,6 +351,55 @@ async fn network_policy_reaches_creation_and_block_requires_provider_confirmatio
 }
 
 #[tokio::test]
+async fn docker_host_network_reaches_only_the_docker_provider_without_weakening_the_spec() {
+    let mut fixture = Fixture::new(EnvironmentBehavior::Fail);
+    let options = &mut Arc::get_mut(&mut fixture.executor).unwrap().options;
+    options.docker_host_network = true;
+    options.network = NetworkPolicy::Block;
+    fixture.provider.allow_create.notify_one();
+    let mut scope = ScopeSpec::new(ir::ScopeId::new(0), "scope-0")
+        .with_runtime(ir::RuntimeSpec::container("test-image"));
+    scope.services.push(ServiceSpec::new("db", "alpine:3.20"));
+    fixture
+        .acquire_scope(scope)
+        .await
+        .expect("acquisition task")
+        .expect_err("the fake provider stops at environment discovery");
+    let spec = fixture.provider.requests.lock().unwrap()[0].clone();
+    let config: sandbox_driver_docker_config::DockerProviderConfig =
+        serde_json::from_value(spec.provider_config.clone()).unwrap();
+    assert!(config.host_network);
+    assert_eq!(
+        config.sidecars.len(),
+        1,
+        "sidecars are not silently removed"
+    );
+    assert_eq!(
+        spec.network,
+        NetworkPolicy::Block,
+        "the incompatible policy still reaches the provider for rejection"
+    );
+    fixture.assert_deleted().await;
+
+    let mut other = Fixture::for_kind(EnvironmentBehavior::Fail, "other");
+    Arc::get_mut(&mut other.executor)
+        .unwrap()
+        .options
+        .docker_host_network = true;
+    other.provider.allow_create.notify_one();
+    other
+        .acquire()
+        .await
+        .expect("acquisition task")
+        .expect_err("the fake provider stops at environment discovery");
+    let spec = other.provider.requests.lock().unwrap()[0].clone();
+    let config: sandbox_driver_docker_config::DockerProviderConfig =
+        serde_json::from_value(spec.provider_config.clone()).unwrap();
+    assert!(!config.host_network);
+    other.assert_deleted().await;
+}
+
+#[tokio::test]
 async fn a_reused_sandbox_cannot_bypass_the_block_policy() {
     let mut fixture = Fixture::new(EnvironmentBehavior::Wait);
     Arc::get_mut(&mut fixture.executor).unwrap().options.network = NetworkPolicy::Block;
@@ -369,6 +425,56 @@ async fn a_reused_sandbox_cannot_bypass_the_block_policy() {
             .contains("does not report blocked networking")
     );
     assert_eq!(fixture.provider.requests.lock().unwrap().len(), 1);
+    fixture
+        .executor
+        .manager()
+        .release_lease(LEASE, Retention::Never, executor::ScopeOutcome::Failed)
+        .await;
+    fixture.assert_deleted().await;
+}
+
+#[tokio::test]
+async fn a_host_network_lease_cannot_be_reused_with_bridge_configuration() {
+    let mut fixture = Fixture::new(EnvironmentBehavior::Wait);
+    let mut options = crate::SandboxOptions {
+        backend: crate::SandboxBackend::Docker,
+        docker_host_network: true,
+        ..Default::default()
+    };
+    fixture.executor = Arc::new(SandboxExecutor::new(
+        Arc::new(FixedProvider::new(fixture.provider.clone())),
+        fixture.ledger.clone(),
+        Arc::new(RunIdentity::for_run_dir(fixture.dir.path().to_path_buf())),
+        Retention::Always,
+        Some(crate::DOCKER_HOST_ALIAS.to_owned()),
+        options.clone(),
+    ));
+    fixture.provider.allow_create.notify_one();
+    fixture.provider.sandbox.allow_environment.notify_one();
+    let scope = ScopeSpec::new(ir::ScopeId::new(0), "scope-0")
+        .with_runtime(ir::RuntimeSpec::container("test-image"));
+    let ctx = AcquireContext::bare().with_lease(LEASE);
+    let handle = fixture.executor.acquire(&scope, &ctx).await.unwrap();
+    fixture
+        .executor
+        .release(handle, executor::ScopeOutcome::Succeeded)
+        .await;
+
+    options.docker_host_network = false;
+    let bridge = SandboxExecutor::new(
+        Arc::new(FixedProvider::new(fixture.provider.clone())),
+        fixture.ledger.clone(),
+        Arc::new(RunIdentity::for_run_dir(fixture.dir.path().to_path_buf())),
+        Retention::Always,
+        Some(crate::DOCKER_HOST_ALIAS.to_owned()),
+        options,
+    );
+    let error = bridge.acquire(&scope, &ctx).await.unwrap_err();
+    assert!(
+        error.to_string().contains("host-network"),
+        "the lease fingerprint identifies the incompatible mode: {error}"
+    );
+
     fixture
         .executor
         .manager()
