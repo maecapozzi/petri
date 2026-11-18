@@ -546,6 +546,39 @@ async fn host_network_reaches_docker_and_its_one_shots() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn default_network_mode_remains_bridge() {
+    use std::process::Command;
+
+    if !is_docker_ready().await {
+        return;
+    }
+    let dir = RunDir::new("sandbox-docker-bridge-network");
+    let executor = RoutingExecutor::with_options(dir.path(), Retention::Never, SandboxOptions {
+        backend: SandboxBackend::Docker,
+        ..Default::default()
+    })
+    .with_run_id(dir.run_id());
+    let handle = executor
+        .acquire(&container_scope(ALPINE), &AcquireContext::bare())
+        .await
+        .expect("acquire a bridge-network sandbox");
+    let mode = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.HostConfig.NetworkMode}}",
+            &name(&dir),
+        ])
+        .output()
+        .expect("docker inspect");
+    assert!(mode.status.success());
+    assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "bridge");
+
+    let report = executor.release(handle, ScopeOutcome::Succeeded).await;
+    assert!(report.is_clean(), "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn host_network_rejects_restricted_policies_and_sidecars() {
     use executor::ServiceSpec;
 

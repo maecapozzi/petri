@@ -1,13 +1,119 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use executor::{AcquireContext, MapSecrets, NoProgress, ScopeSpec, ServiceSpec};
 use ir::{ContainerOptions, RegistryCredentials, RuntimeSpec, RuntimeTarget, ScopeId};
-use sandbox_driver::{Resources, SandboxKind, SandboxSource};
+use sandbox_driver::{
+    Capabilities, Error, EventContext, Isolation, ProviderKind, ResourceKind, Resources, Sandbox,
+    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec,
+    SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotState, SnapshotStatus,
+};
 use sandbox_driver_daytona_config::{DaytonaProviderConfig, DockerExecutionTarget};
+use testkit::RunDir;
 
-use crate::build_daytona_spec;
 use crate::snapshots::RunnerSnapshot;
+use crate::{
+    FixedProvider, MemoryLedger, RunIdentity, SandboxBackend, SandboxExecutor, SandboxOptions,
+    build_daytona_spec,
+};
+
+#[derive(Default)]
+struct Snapshots {
+    status: Mutex<Option<SnapshotStatus>>,
+}
+
+#[async_trait]
+impl SnapshotProvider for Snapshots {
+    async fn create(
+        &self,
+        spec: &SnapshotSpec,
+        _: Option<EventContext>,
+    ) -> sandbox_driver::Result<SnapshotId> {
+        let id = SnapshotId::try_new(spec.name.as_ref().unwrap()).unwrap();
+        let mut status = SnapshotStatus::new(id.clone(), SnapshotState::Active);
+        status.sandbox_kind = spec.sandbox_kind;
+        let mut resources = spec.resources;
+        resources.disk_mb.get_or_insert(3 * 1024);
+        status.resources = Some(resources);
+        status.regions = spec.region.iter().cloned().collect();
+        *self.status.lock().unwrap() = Some(status);
+        Ok(id)
+    }
+
+    async fn get(&self, id: &SnapshotId) -> sandbox_driver::Result<SnapshotStatus> {
+        self.status
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::NotFound {
+                resource: ResourceKind::Snapshot,
+                id:       id.as_str().to_owned(),
+            })
+    }
+
+    async fn list(&self, _: &SnapshotFilter) -> sandbox_driver::Result<Vec<SnapshotStatus>> {
+        panic!("runner snapshot preparation does not list snapshots")
+    }
+
+    async fn delete(&self, _: &SnapshotId, _: Option<EventContext>) -> sandbox_driver::Result<()> {
+        panic!("runner snapshots are shared")
+    }
+}
+
+struct DaytonaProvider {
+    kind:         ProviderKind,
+    capabilities: Capabilities,
+    snapshots:    Snapshots,
+}
+
+impl DaytonaProvider {
+    fn new() -> Self {
+        Self {
+            kind:         ProviderKind::try_new("daytona").unwrap(),
+            capabilities: Capabilities::minimal(Isolation::Container),
+            snapshots:    Snapshots::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for DaytonaProvider {
+    fn kind(&self) -> &ProviderKind {
+        &self.kind
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    async fn create(
+        &self,
+        _: &SandboxSpec,
+        _: Option<EventContext>,
+    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+        panic!("the test builds a spec without creating a sandbox")
+    }
+
+    async fn attach(
+        &self,
+        _: &SandboxId,
+        _: Option<EventContext>,
+    ) -> sandbox_driver::Result<Arc<dyn Sandbox>> {
+        panic!("the test does not attach a sandbox")
+    }
+
+    async fn list(
+        &self,
+        _: &SandboxFilter,
+    ) -> sandbox_driver::Result<Vec<sandbox_driver::SandboxStatus>> {
+        panic!("the test does not list sandboxes")
+    }
+
+    fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
+        Some(&self.snapshots)
+    }
+}
 
 fn snapshot() -> RunnerSnapshot {
     RunnerSnapshot::new(
@@ -123,6 +229,38 @@ fn container_jobs_keep_options_services_and_credentials_inside_the_vm() {
         docker.options.registry_auth.unwrap().password,
         "private-password"
     );
+}
+
+#[tokio::test]
+async fn docker_host_network_does_not_reach_daytonas_nested_docker() {
+    let dir = RunDir::new("sandbox-daytona-host-network-exclusion");
+    let provider = Arc::new(DaytonaProvider::new());
+    let executor = SandboxExecutor::new(
+        Arc::new(FixedProvider::new(provider.clone())),
+        Arc::new(MemoryLedger::default()),
+        Arc::new(RunIdentity::for_run_dir(dir.path().to_path_buf())),
+        executor::Retention::Never,
+        None,
+        SandboxOptions {
+            backend: SandboxBackend::Daytona,
+            docker_host_network: true,
+            ..Default::default()
+        },
+    );
+    let scope =
+        ScopeSpec::new(ScopeId::new(1), "job").with_runtime(RuntimeSpec::container("alpine:3.20"));
+    let spec = executor
+        .build_spec(
+            &scope,
+            &[],
+            "daytona-host-network-exclusion",
+            &AcquireContext::bare(),
+            &*provider,
+        )
+        .await
+        .unwrap();
+    let config: DaytonaProviderConfig = serde_json::from_value(spec.provider_config).unwrap();
+    assert!(!config.docker.unwrap().options.host_network);
 }
 
 #[test]

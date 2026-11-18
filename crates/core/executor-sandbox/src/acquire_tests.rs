@@ -352,6 +352,19 @@ async fn network_policy_reaches_creation_and_block_requires_provider_confirmatio
 
 #[tokio::test]
 async fn docker_host_network_reaches_only_the_docker_provider_without_weakening_the_spec() {
+    let default = Fixture::new(EnvironmentBehavior::Fail);
+    default.provider.allow_create.notify_one();
+    default
+        .acquire()
+        .await
+        .expect("acquisition task")
+        .expect_err("the fake provider stops at environment discovery");
+    let spec = default.provider.requests.lock().unwrap()[0].clone();
+    let config: sandbox_driver_docker_config::DockerProviderConfig =
+        serde_json::from_value(spec.provider_config).unwrap();
+    assert!(!config.host_network);
+    default.assert_deleted().await;
+
     let mut fixture = Fixture::new(EnvironmentBehavior::Fail);
     let options = &mut Arc::get_mut(&mut fixture.executor).unwrap().options;
     options.docker_host_network = true;
