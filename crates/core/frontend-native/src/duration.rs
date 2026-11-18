@@ -5,7 +5,7 @@ use std::time::Duration;
 pub(crate) fn parse(text: &str) -> Option<Duration> {
     let text = text.trim();
     if let Ok(secs) = text.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
+        return secs.checked_mul(1_000).map(Duration::from_millis);
     }
     let split = text.find(|c: char| !c.is_ascii_digit() && c != '.')?;
     let (number, unit) = text.split_at(split);

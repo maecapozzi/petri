@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use petri::attractor::{
-    AGENT_KIND, CommandStep, HumanStep, StageStep, StubStep, WAIT_KIND, WORKFLOW_KIND,
+    AGENT_KIND, BranchStep, CommandStep, FanInStep, ForkStep, HumanStep, StageStep, StubStep,
+    WAIT_KIND, WORKFLOW_KIND,
 };
 use petri::engine::{EngineState, Event, EventRecord, RunError};
 use petri::execution::controls::{ControlError, ControlService};
@@ -28,13 +29,16 @@ use petri::execution::{
 use petri::executor::Retention;
 use petri::frontend::fabro::Fabro;
 use petri::frontend::{CompileInputs, Lowered};
-use petri::ir::{FiringId, Graph, RunStatus, Status, Value};
-use petri::steps::Answer;
+use petri::ir::{
+    Control, FiringId, Graph, GraphBuilder, Outcome, RunStatus, Scope, ScopeId, Status, StepEvent,
+    Value,
+};
+use petri::steps::{Answer, Step, StepCtx};
 use petri::{RunOptions, Runtime, driver};
 use serde_json::json;
 use testkit::RunDir;
 use tokio::sync::Notify;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 fn runtime(dir: &RunDir) -> Runtime {
@@ -47,6 +51,9 @@ fn runtime(dir: &RunDir) -> Runtime {
         registry.register_runner(Arc::new(StubStep::new((*kind).clone())));
     }
     registry.register(CommandStep);
+    registry.register(ForkStep);
+    registry.register(BranchStep);
+    registry.register(FanInStep);
     registry.register(HumanStep);
     registry.register(StageStep);
     Runtime::standard()
@@ -505,6 +512,138 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
     );
 }
 
+struct HeartbeatOnly;
+
+#[async_trait::async_trait]
+impl Step for HeartbeatOnly {
+    const NAME: &'static str = "test/heartbeat-only";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        loop {
+            tokio::select! {
+                () = sleep(Duration::from_millis(20)) => {
+                    let _ = ctx
+                        .logs
+                        .send(StepEvent::Custom(json!({"kind": "heartbeat"})))
+                        .await;
+                }
+                control = ctx.control.recv() => match control {
+                    Some(Control::Cancel | Control::Kill) | None => {
+                        return Outcome::cancelled();
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+struct ToolActivityOnly;
+
+#[async_trait::async_trait]
+impl Step for ToolActivityOnly {
+    const NAME: &'static str = "test/tool-activity-only";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        let started = Instant::now();
+        loop {
+            tokio::select! {
+                () = sleep(Duration::from_millis(50)) => {
+                    let _ = ctx
+                        .logs
+                        .send(StepEvent::Custom(json!({
+                            "kind": "pebble",
+                            "event": {
+                                "event": {
+                                    "ToolCallStarted": {
+                                        "tool_name": "shell"
+                                    }
+                                }
+                            }
+                        })))
+                        .await;
+                    if started.elapsed() >= Duration::from_millis(700) {
+                        return Outcome::success(Value::Null);
+                    }
+                }
+                control = ctx.control.recv() => match control {
+                    Some(Control::Cancel | Control::Kill) | None => {
+                        return Outcome::cancelled();
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Typed heartbeat/status traffic is durable but not meaningful execution
+/// progress, so it cannot keep an otherwise idle run alive.
+#[tokio::test]
+async fn heartbeat_only_traffic_still_expires_as_idle() {
+    let dir = RunDir::new("watchdog-heartbeat-only");
+    let rt = runtime(&dir).step(HeartbeatOnly);
+    let mut builder = GraphBuilder::bare();
+    builder.graph_mut().policy.stall_timeout = Some(Duration::from_millis(300));
+    builder.graph_mut().policy.max_active_duration = None;
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("poll", scope, HeartbeatOnly::NAME);
+    let watchdog = RunWatchdog::with_limits(Some(Duration::from_millis(300)), None);
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(
+            &rt,
+            HostRun::new(builder.build()).observe(Arc::new(watchdog.clone())),
+            |handle, _| task = Some(watchdog.start(handle)),
+        ),
+    )
+    .await
+    .expect("idle timeout and cleanup are bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::Stall(timeout))
+            if timeout.stall_timeout_ms == 300 && timeout.idle_ms >= 300
+    ));
+}
+
+/// Pebble's typed tool lifecycle is real execution activity even when a tool
+/// is otherwise silent, so it refreshes inactivity structurally.
+#[tokio::test]
+async fn typed_tool_activity_refreshes_inactivity() {
+    let dir = RunDir::new("watchdog-tool-activity");
+    let rt = runtime(&dir).step(ToolActivityOnly);
+    let mut builder = GraphBuilder::bare();
+    builder.graph_mut().policy.stall_timeout = Some(Duration::from_millis(300));
+    builder.graph_mut().policy.max_active_duration = None;
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("tool", scope, ToolActivityOnly::NAME);
+    let watchdog = RunWatchdog::with_limits(Some(Duration::from_millis(300)), None);
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(
+            &rt,
+            HostRun::new(builder.build()).observe(Arc::new(watchdog.clone())),
+            |handle, _| task = Some(watchdog.start(handle)),
+        ),
+    )
+    .await
+    .expect("the active tool run is bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+
+    assert_eq!(report.status, RunStatus::Success);
+    assert_eq!(watchdog.timeout_reason(), None);
+    assert!(watchdog.state().active_duration_ms >= 600);
+}
+
 /// Meaningful output keeps inactivity fresh, but cannot reset the independent
 /// maximum active-runtime backstop. Cancellation still follows the native
 /// coordinator path and is replayable.
@@ -780,6 +919,77 @@ async fn a_pending_question_parks_the_watchdog() {
         report.state.errors()
     );
     assert!(receipt.is_clean(), "{:?}", receipt.errors);
+}
+
+/// A question parks only its own branch. An independently running sibling
+/// keeps consuming the maximum active-runtime budget, and timeout
+/// cancellation joins both branches and the pending interview.
+#[tokio::test]
+async fn an_active_sibling_keeps_a_pending_question_bounded() {
+    const PARALLEL: &str = r#"digraph G {
+        graph [stall_timeout="0s", max_active_duration="400ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        fork [shape=component]
+        gate [shape=hexagon, label="Go?"]
+        long [shape=parallelogram, script="sleep 20"]
+        merge [shape=tripleoctagon]
+        start -> fork
+        fork -> gate
+        fork -> long
+        gate -> merge [label="[Y] Yes"]
+        long -> merge
+        merge -> exit
+    }"#;
+
+    struct WaitForCancellation;
+
+    #[async_trait::async_trait]
+    impl Interviewer for WaitForCancellation {
+        async fn reply(&self, _: InterviewRequest, cancel: CancellationToken) -> InterviewReply {
+            cancel.cancelled().await;
+            InterviewReply::Cancelled
+        }
+    }
+
+    let dir = RunDir::new("watchdog-question-with-active-sibling");
+    let rt = runtime(&dir);
+    let lowered = lower(&rt, &dir, PARALLEL);
+    let graph = lowered.graph.expect("lowers");
+    let watchdog =
+        RunWatchdog::with_limits(graph.policy.stall_timeout, graph.policy.max_active_duration);
+    let dispatcher = InterviewDispatcher::new(Arc::new(WaitForCancellation));
+    let host_run = HostRun::new(graph)
+        .with_children(lowered.children)
+        .observe(Arc::new(watchdog.clone()))
+        .observe(Arc::new(dispatcher.clone()));
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(&rt, host_run, |handle, secrets| {
+            dispatcher.wire(handle.clone(), secrets);
+            task = Some(watchdog.start(handle));
+        }),
+    )
+    .await
+    .expect("timeout cancellation and native cleanup are bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+    let receipt = dispatcher.shutdown().await;
+
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 400
+                && timeout.active_duration_ms >= 400
+    ));
+    assert!(receipt.is_clean(), "{receipt:?}");
+    let document = inspect_run_dir(dir.path()).await.expect("inspects");
+    assert!(
+        document.complete,
+        "all child work is terminal before the host returns: {document:?}"
+    );
 }
 
 // ── Controls ────────────────────────────────────────────────────────────────

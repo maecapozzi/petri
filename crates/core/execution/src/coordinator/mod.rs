@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use driver::{ExecutionSlot, HookContext, ParentLink};
-use engine::{EngineExit, EngineStart, EntryPoint, Event, MiddlewareKey};
+use engine::{EngineExit, EngineStart, EngineState, EntryPoint, Event, MiddlewareKey};
 use ir::{Graph, RunStatus, Value};
 use runtime::{RunAccess, RunRuntime};
 use smol_str::SmolStr;
@@ -158,6 +158,7 @@ struct PreparedExecution {
     driver:            driver::Driver,
     pipeline:          Arc<MiddlewarePipeline>,
     cancel_before_run: bool,
+    resumed_state:     Option<EngineState>,
     /// The fork slot a gated child holds while it is live, released once
     /// its `ExecutionFinished` is recorded.
     slot:              Option<ExecutionSlot>,
@@ -848,6 +849,7 @@ impl Coordinator {
             driver,
             pipeline,
             cancel_before_run,
+            resumed_state,
             slot,
             leases,
         } = self
@@ -862,6 +864,11 @@ impl Coordinator {
             .await?;
         let handle = driver.handle();
         self.live.run(invocation, execution, handle.clone(), leases);
+        if let Some(resumed_state) = resumed_state {
+            for observer in &self.observers {
+                observer.on_execution_resumed(execution, &resumed_state);
+            }
+        }
         running.spawn(async move {
             if cancel_before_run {
                 handle.cancel(ir::CancelScopeId::ROOT).await;
@@ -1071,7 +1078,7 @@ impl Coordinator {
         );
         let decoded = read_execution_log(&**self.store.logs(), execution).await?;
         let context = self.hook_context(invocation, execution);
-        let (driver, writer, leases) = if decoded.log.is_empty() {
+        let (driver, writer, leases, resumed_state) = if decoded.log.is_empty() {
             let writer = Arc::new(ExecutionLogWriter::new(self.writer.clone(), execution, 0));
             let (sandbox, leases) = self
                 .prepare_sandbox(invocation, execution, writer.clone())
@@ -1084,7 +1091,7 @@ impl Coordinator {
                 sandbox,
                 secrets,
             );
-            (driver, writer, leases)
+            (driver, writer, leases, None)
         } else {
             // Replaying an existing root cancellation already restores it.
             // Sending it again would ask the driver to escalate to a kill.
@@ -1107,9 +1114,6 @@ impl Coordinator {
                 })?;
             }
             let resumed_state = engine::replay((*graph).clone(), &decoded.log);
-            for observer in &self.observers {
-                observer.on_execution_resumed(execution, &resumed_state);
-            }
             let high_water = decoded.log.len() as u64;
             let writer = Arc::new(ExecutionLogWriter::new(
                 self.writer.clone(),
@@ -1127,7 +1131,12 @@ impl Coordinator {
                 sandbox,
                 secrets,
             )?;
-            (driver.with_engine_start(start.clone()), writer, leases)
+            (
+                driver.with_engine_start(start.clone()),
+                writer,
+                leases,
+                Some(resumed_state),
+            )
         };
         let client = CoordinatorInvocationClient::new(execution, self.start_tx.clone());
         let identity = crate::ExecutionIdentity {
@@ -1161,6 +1170,7 @@ impl Coordinator {
             driver,
             pipeline,
             cancel_before_run,
+            resumed_state,
             slot: execution_slot,
             leases,
         })

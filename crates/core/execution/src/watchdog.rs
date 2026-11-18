@@ -6,12 +6,13 @@
 //! independent sibling keeps the clocks running.
 //!
 //! Inactivity is refreshed by non-empty log output, artifacts, Petri's
-//! structurally identified model events, or an explicit host call to
-//! [`RunWatchdog::record_activity`]. Coordinator bookkeeping, retries,
-//! heartbeats, and arbitrary custom payloads are not activity. Embedding
-//! hosts use that hook for native tool events after classifying their typed
-//! event, without interpreting model prose. In particular, run-management
-//! polling, gather/wait bookkeeping, and heartbeats must not call it.
+//! structurally identified model events (including Pebble's typed tool
+//! lifecycle), or an explicit host call to [`RunWatchdog::record_activity`].
+//! Coordinator bookkeeping, retries, heartbeats, and arbitrary custom
+//! payloads are not activity. Embedding hosts use that hook for other native
+//! tool events after classifying their typed event, without interpreting
+//! model prose. In particular, run-management polling, gather/wait
+//! bookkeeping, and heartbeats must not call it.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -56,6 +57,7 @@ pub enum RunTimeout {
 struct State {
     durable:          RunTimeoutState,
     paused:           bool,
+    redispatch_ready: bool,
     last_tick:        Instant,
     active_remainder: Duration,
     idle_remainder:   Duration,
@@ -73,7 +75,10 @@ impl State {
     }
 
     fn idle_clock_runs(&self) -> bool {
-        self.durable.started && !self.paused && !self.questions_cover_running()
+        self.durable.started
+            && self.redispatch_ready
+            && !self.paused
+            && !self.questions_cover_running()
     }
 
     fn active_clock_runs(&self) -> bool {
@@ -147,6 +152,7 @@ impl RunWatchdog {
                 state: Mutex::new(State {
                     durable:          RunTimeoutState::default(),
                     paused:           false,
+                    redispatch_ready: true,
                     last_tick:        Instant::now(),
                     active_remainder: Duration::ZERO,
                     idle_remainder:   Duration::ZERO,
@@ -175,11 +181,14 @@ impl RunWatchdog {
     ///
     /// This is useful when the host persists coordinator events in its own
     /// store. Missing accounting must be passed as `None`; that restores zero
-    /// rather than deriving elapsed time from timestamps.
+    /// rather than deriving elapsed time from timestamps. Restored clocks stay
+    /// parked until the observer receives `on_execution_resumed`, after the
+    /// host has completed recovery setup and is ready to dispatch execution.
     pub fn restore(&self, restored: Option<&RunTimeoutState>, paused: bool) {
         let mut state = self.inner.state();
         state.durable = restored.cloned().unwrap_or_default();
         state.paused = paused;
+        state.redispatch_ready = false;
         state.last_tick = Instant::now();
         state.active_remainder = Duration::ZERO;
         state.idle_remainder = Duration::ZERO;
@@ -386,6 +395,8 @@ fn petri_model_activity(value: &serde_json::Value) -> bool {
     };
     event.contains_key("LlmRequestStarted")
         || event.contains_key("LlmFirstOutput")
+        || event.contains_key("ToolCallStarted")
+        || event.contains_key("ToolCallCompleted")
         || event.contains_key("AssistantMessage")
         || non_empty_string(event, "TextDelta", "delta")
         || non_empty_string(event, "ReasoningDelta", "delta")
@@ -429,6 +440,7 @@ impl ExecutionObserver for RunWatchdog {
         match &record.event {
             Event::StepStarted { firing, .. } => {
                 state.durable.started = true;
+                state.redispatch_ready = true;
                 state.durable.running.insert(RunTimeoutWork {
                     execution,
                     firing: *firing,
@@ -543,6 +555,7 @@ impl ExecutionObserver for RunWatchdog {
             .questions
             .extend(pending_questions(execution, engine));
         state.durable.started |= !state.durable.running.is_empty();
+        state.redispatch_ready = true;
         state.last_tick = now;
     }
 }
@@ -647,6 +660,49 @@ mod tests {
         assert_eq!(state.idle_duration_ms, 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn restored_work_does_not_count_recovery_setup() {
+        let watchdog =
+            RunWatchdog::with_limits(Some(Duration::from_secs(10)), Some(Duration::from_secs(90)));
+        let restored = RunTimeoutState {
+            started: true,
+            running: BTreeSet::from([
+                RunTimeoutWork {
+                    execution: ExecutionId::new(0),
+                    firing:    ir::FiringId::new(1),
+                },
+                RunTimeoutWork {
+                    execution: ExecutionId::new(1),
+                    firing:    ir::FiringId::new(2),
+                },
+            ]),
+            questions: BTreeSet::from([RunTimeoutQuestion {
+                execution: ExecutionId::new(0),
+                firing:    ir::FiringId::new(1),
+                question:  "gate".into(),
+            }]),
+            ..RunTimeoutState::default()
+        };
+        watchdog.restore(Some(&restored), false);
+
+        advance(Duration::from_secs(30)).await;
+
+        let state = watchdog.state();
+        assert_eq!(state.active_duration_ms, 0);
+        assert_eq!(state.idle_duration_ms, 0);
+        assert_eq!(state.running, restored.running);
+        assert_eq!(state.questions, restored.questions);
+
+        {
+            let mut state = watchdog.inner.state();
+            state.redispatch_ready = true;
+        }
+        advance(Duration::from_secs(5)).await;
+        let state = watchdog.state();
+        assert_eq!(state.active_duration_ms, 5_000);
+        assert_eq!(state.idle_duration_ms, 5_000);
+    }
+
     #[test]
     fn sub_millisecond_activity_cannot_discard_active_runtime() {
         let watchdog = RunWatchdog::with_limits(None, Some(Duration::from_millis(10)));
@@ -721,6 +777,12 @@ mod tests {
             "kind": "pebble",
             "event": {"event": {"TextDelta": {"delta": "work"}}}
         }))));
+        for variant in ["ToolCallStarted", "ToolCallCompleted"] {
+            assert!(meaningful_progress(&StepEvent::Custom(serde_json::json!({
+                "kind": "pebble",
+                "event": {"event": {(variant): {"tool_name": "shell"}}}
+            }))));
+        }
         assert!(!meaningful_progress(&StepEvent::Custom(
             serde_json::json!({
                 "kind": "pebble",

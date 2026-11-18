@@ -1531,21 +1531,23 @@ their own.
 `max_active_duration`, default 90 m; `0s` disables either clock). The
 standalone host installs `execution::watchdog::RunWatchdog` as an observer.
 The inactivity clock is refreshed by non-empty process output, artifacts,
-Petri's typed model-execution events, or a host's explicit
-`RunWatchdog::record_activity` call for a typed model/tool event. Coordinator
-records, retries, heartbeats, arbitrary custom payloads, status polling, and
-gather/wait bookkeeping do not refresh it. Hosts must classify their native
-run-management tools before calling the hook; they must not infer activity
-from arbitrary model prose.
+Petri's typed model-execution and Pebble `ToolCallStarted` /
+`ToolCallCompleted` events, or a host's explicit
+`RunWatchdog::record_activity` call for another typed model/tool event.
+Coordinator records, retries, heartbeats, arbitrary custom payloads, status
+polling, and gather/wait bookkeeping do not refresh it. Hosts must classify
+their native run-management tools before calling the hook; they must not
+infer activity from arbitrary model prose.
 
 The maximum-active-duration clock never resets for ordinary progress. Queue
 time before execution starts is excluded. A global pause parks both clocks.
 Questions park both only when every running firing is waiting for a person;
 an independent sibling keeps them running. The coordinator durably
 checkpoints accumulated milliseconds plus running firings and pending
-questions. On resume the watchdog restores the checkpoint and reconciles it
-with every replayed engine log before work is redispatched. Process downtime
-is not counted.
+questions. On resume the watchdog restores the checkpoint while its clocks
+remain parked. After sandbox and other recovery setup, each replayed engine
+log is reconciled immediately before its work is redispatched; only then can
+the clocks run again. Process downtime and recovery setup are not counted.
 
 An inactivity expiry records `CancelReason::StallTimeout`; an active-runtime
 expiry records the distinct `CancelReason::MaximumActiveDuration`, including

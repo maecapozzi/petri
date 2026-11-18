@@ -53,7 +53,12 @@ fn run_timeout_policy_defaults_overrides_and_disables() {
 
 #[test]
 fn malformed_negative_and_overflowing_run_durations_are_rejected() {
-    for value in ["later", "-1s", "18446744073709551616s"] {
+    for value in [
+        "later",
+        "-1s",
+        "18446744073709551616s",
+        "18446744073709551615",
+    ] {
         let diags = diagnostics(&format!(
             "policy:\n  max_active_duration: {value}\nnodes:\n  work:\n    run: true\n"
         ));
