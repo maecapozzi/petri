@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::iter::once;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -55,34 +56,45 @@ pub enum RunTimeout {
 }
 
 struct State {
-    durable:          RunTimeoutState,
-    paused:           bool,
-    redispatch_ready: bool,
-    last_tick:        Instant,
-    active_remainder: Duration,
-    idle_remainder:   Duration,
-    tripped:          Option<RunTimeout>,
+    durable:            RunTimeoutState,
+    paused:             bool,
+    redispatch_pending: BTreeSet<ExecutionId>,
+    last_tick:          Instant,
+    active_remainder:   Duration,
+    idle_remainder:     Duration,
+    tripped:            Option<RunTimeout>,
 }
 
 impl State {
     fn questions_cover_running(&self) -> bool {
-        !self.durable.running.is_empty()
-            && self.durable.running.iter().all(|work| {
-                self.durable.questions.iter().any(|question| {
-                    question.execution == work.execution && question.firing == work.firing
-                })
+        let mut ready = self
+            .durable
+            .running
+            .iter()
+            .filter(|work| !self.redispatch_pending.contains(&work.execution));
+        let Some(first) = ready.next() else {
+            // Restored work whose execution has not been redispatched is
+            // recovery setup, not idle or active execution.
+            return !self.durable.running.is_empty();
+        };
+        once(first).chain(ready).all(|work| {
+            self.durable.questions.iter().any(|question| {
+                question.execution == work.execution && question.firing == work.firing
             })
+        })
     }
 
     fn idle_clock_runs(&self) -> bool {
-        self.durable.started
-            && self.redispatch_ready
-            && !self.paused
-            && !self.questions_cover_running()
+        self.durable.started && !self.paused && !self.questions_cover_running()
     }
 
     fn active_clock_runs(&self) -> bool {
-        self.idle_clock_runs() && !self.durable.running.is_empty()
+        self.idle_clock_runs()
+            && self
+                .durable
+                .running
+                .iter()
+                .any(|work| !self.redispatch_pending.contains(&work.execution))
     }
 
     fn settle(&mut self, now: Instant) {
@@ -150,13 +162,13 @@ impl RunWatchdog {
                 stall_timeout,
                 max_active_duration,
                 state: Mutex::new(State {
-                    durable:          RunTimeoutState::default(),
-                    paused:           false,
-                    redispatch_ready: true,
-                    last_tick:        Instant::now(),
-                    active_remainder: Duration::ZERO,
-                    idle_remainder:   Duration::ZERO,
-                    tripped:          None,
+                    durable:            RunTimeoutState::default(),
+                    paused:             false,
+                    redispatch_pending: BTreeSet::new(),
+                    last_tick:          Instant::now(),
+                    active_remainder:   Duration::ZERO,
+                    idle_remainder:     Duration::ZERO,
+                    tripped:            None,
                 }),
             }),
             stop:  CancellationToken::new(),
@@ -182,13 +194,19 @@ impl RunWatchdog {
     /// This is useful when the host persists coordinator events in its own
     /// store. Missing accounting must be passed as `None`; that restores zero
     /// rather than deriving elapsed time from timestamps. Restored clocks stay
-    /// parked until the observer receives `on_execution_resumed`, after the
-    /// host has completed recovery setup and is ready to dispatch execution.
+    /// parked per execution until the observer receives
+    /// `on_execution_resumed` for that execution, after the host has
+    /// completed its recovery setup and is ready to dispatch it.
     pub fn restore(&self, restored: Option<&RunTimeoutState>, paused: bool) {
         let mut state = self.inner.state();
         state.durable = restored.cloned().unwrap_or_default();
         state.paused = paused;
-        state.redispatch_ready = false;
+        state.redispatch_pending = state
+            .durable
+            .running
+            .iter()
+            .map(|work| work.execution)
+            .collect();
         state.last_tick = Instant::now();
         state.active_remainder = Duration::ZERO;
         state.idle_remainder = Duration::ZERO;
@@ -440,7 +458,6 @@ impl ExecutionObserver for RunWatchdog {
         match &record.event {
             Event::StepStarted { firing, .. } => {
                 state.durable.started = true;
-                state.redispatch_ready = true;
                 state.durable.running.insert(RunTimeoutWork {
                     execution,
                     firing: *firing,
@@ -523,6 +540,8 @@ impl ExecutionObserver for RunWatchdog {
         own.durable
             .questions
             .retain(|question| !finished.contains(&question.execution));
+        own.redispatch_pending
+            .retain(|execution| !finished.contains(execution));
     }
 
     fn on_execution_resumed(&self, execution: ExecutionId, engine: &EngineState) {
@@ -555,7 +574,7 @@ impl ExecutionObserver for RunWatchdog {
             .questions
             .extend(pending_questions(execution, engine));
         state.durable.started |= !state.durable.running.is_empty();
-        state.redispatch_ready = true;
+        state.redispatch_pending.remove(&execution);
         state.last_tick = now;
     }
 }
@@ -608,10 +627,51 @@ fn pending_questions(
 mod tests {
     use std::future::pending;
 
+    use engine::{Admission, Command, EngineStart, apply};
+    use ir::{GraphBuilder, Scope, ScopeId};
     use tokio::task::yield_now;
     use tokio::time::{advance, timeout};
 
     use super::*;
+
+    fn running_engine(question: Option<Question>) -> EngineState {
+        let mut graph = GraphBuilder::bare();
+        let scope = graph.add_scope(Scope::new(ScopeId::new(0)));
+        graph.add_step("work", scope, "noop");
+        let (mut state, mut commands) =
+            apply(EngineState::new(graph.build()), Event::ExecutionStarted {
+                start: EngineStart::default(),
+            });
+        let resolved = loop {
+            let command = commands
+                .into_iter()
+                .find(|command| matches!(command, Command::Admit { .. } | Command::StartStep(_)))
+                .expect("the engine either asks for admission or starts the step");
+            match command {
+                Command::Admit { decision_id } => {
+                    (state, commands) = apply(state, Event::AdmissionDecided {
+                        decision_id,
+                        decision: Admission::Admit,
+                        trace: Vec::new(),
+                    });
+                }
+                Command::StartStep(resolved) => break resolved,
+                _ => unreachable!("the command was filtered above"),
+            }
+        };
+        let firing = resolved.id();
+        let (mut state, _) = apply(state, Event::StepStarted {
+            firing,
+            attempt: resolved.attempt(),
+        });
+        if let Some(question) = question {
+            (state, _) = apply(state, Event::StepProgressRecorded {
+                firing,
+                ev: question.to_event(),
+            });
+        }
+        state
+    }
 
     #[test]
     fn structural_question_parking_requires_every_running_firing() {
@@ -661,24 +721,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn restored_work_does_not_count_recovery_setup() {
+    async fn resumed_question_stays_parked_until_its_sibling_is_redispatched() {
         let watchdog =
             RunWatchdog::with_limits(Some(Duration::from_secs(10)), Some(Duration::from_secs(90)));
+        let waiting = running_engine(Some(Question::new("gate", "Continue?")));
+        let active = running_engine(None);
+        let waiting_firing = waiting.live_firings().next().expect("live work").id;
+        let active_firing = active.live_firings().next().expect("live work").id;
         let restored = RunTimeoutState {
             started: true,
             running: BTreeSet::from([
                 RunTimeoutWork {
                     execution: ExecutionId::new(0),
-                    firing:    ir::FiringId::new(1),
+                    firing:    waiting_firing,
                 },
                 RunTimeoutWork {
                     execution: ExecutionId::new(1),
-                    firing:    ir::FiringId::new(2),
+                    firing:    active_firing,
                 },
             ]),
             questions: BTreeSet::from([RunTimeoutQuestion {
                 execution: ExecutionId::new(0),
-                firing:    ir::FiringId::new(1),
+                firing:    waiting_firing,
                 question:  "gate".into(),
             }]),
             ..RunTimeoutState::default()
@@ -693,10 +757,16 @@ mod tests {
         assert_eq!(state.running, restored.running);
         assert_eq!(state.questions, restored.questions);
 
-        {
-            let mut state = watchdog.inner.state();
-            state.redispatch_ready = true;
-        }
+        watchdog.on_execution_resumed(ExecutionId::new(0), &waiting);
+        advance(Duration::from_secs(5)).await;
+        let state = watchdog.state();
+        assert_eq!(
+            state.active_duration_ms, 0,
+            "the ready execution is parked on its question"
+        );
+        assert_eq!(state.idle_duration_ms, 0);
+
+        watchdog.on_execution_resumed(ExecutionId::new(1), &active);
         advance(Duration::from_secs(5)).await;
         let state = watchdog.state();
         assert_eq!(state.active_duration_ms, 5_000);

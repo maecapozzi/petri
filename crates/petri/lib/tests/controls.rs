@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::sleep as sleep_thread;
 use std::time::{Duration, Instant};
 
 use petri::attractor::{
@@ -23,21 +25,24 @@ use petri::execution::host::{self, HostRun};
 use petri::execution::inspect::inspect_run_dir;
 use petri::execution::watchdog::{RunTimeout, RunWatchdog, StallWatchdog, WatchdogTask};
 use petri::execution::{
-    CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, ExecutionObserver,
-    InterviewDispatcher, InterviewReply, InterviewRequest, Interviewer,
+    CallSite, CancelReason, CoordinatorEvent, CoordinatorInvocationClient, CoordinatorRecord,
+    ExecutionId, ExecutionObserver, GraphDigest, InterviewDispatcher, InterviewReply,
+    InterviewRequest, Interviewer, InvocationClient as _, InvocationRequest, SandboxMode,
+    SecretBindings,
 };
 use petri::executor::Retention;
 use petri::frontend::fabro::Fabro;
 use petri::frontend::{CompileInputs, Lowered};
 use petri::ir::{
     Control, FiringId, Graph, GraphBuilder, Outcome, RunStatus, Scope, ScopeId, Status, StepEvent,
-    Value,
+    StepRef, Value,
 };
-use petri::steps::{Answer, Step, StepCtx};
+use petri::steps::{Answer, Question, Step, StepCtx};
 use petri::{RunOptions, Runtime, driver};
+use serde::Deserialize;
 use serde_json::json;
 use testkit::RunDir;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -97,6 +102,134 @@ fn firings_of(report: &driver::ExecutionReport, node: &str) -> usize {
         .iter()
         .filter(|r| r.name == node)
         .count()
+}
+
+#[derive(Default)]
+struct ResumeTimeoutFixture {
+    root_question:  Notify,
+    child_question: Notify,
+    active_child:   Notify,
+}
+
+#[derive(Deserialize)]
+struct ResumeChildren {
+    question: GraphDigest,
+    active:   GraphDigest,
+}
+
+struct ResumeParentStep;
+
+#[async_trait::async_trait]
+impl Step for ResumeParentStep {
+    const NAME: &'static str = "test/resume-parent";
+    type Config = ResumeChildren;
+
+    async fn run(&self, config: ResumeChildren, ctx: StepCtx) -> Outcome {
+        let client = match ctx.require_capability::<CoordinatorInvocationClient>() {
+            Ok(client) => client,
+            Err(error) => return error.into(),
+        };
+        let start = |slot: &str, graph| {
+            client.start_or_attach(InvocationRequest::new(
+                CallSite {
+                    firing:  ctx.firing,
+                    attempt: ctx.attempt,
+                    slot:    slot.into(),
+                },
+                graph,
+                BTreeMap::new(),
+                SecretBindings::None,
+                SandboxMode::Isolated,
+            ))
+        };
+        let mut question = match start("question", config.question).await {
+            Ok(handle) => handle,
+            Err(error) => return Outcome::failure(error.to_string()),
+        };
+        let mut active = match start("active", config.active).await {
+            Ok(handle) => handle,
+            Err(error) => return Outcome::failure(error.to_string()),
+        };
+        if ctx
+            .logs
+            .send_acked(Question::new("root-wait", "Waiting").to_event())
+            .await
+            .is_err()
+        {
+            return Outcome::failure("could not record the parent question");
+        }
+        let fixture = match ctx.require_capability::<Arc<ResumeTimeoutFixture>>() {
+            Ok(fixture) => fixture,
+            Err(error) => return error.into(),
+        };
+        fixture.root_question.notify_one();
+        let (question, active) = tokio::join!(question.result(), active.result());
+        if question.status == RunStatus::Cancelled || active.status == RunStatus::Cancelled {
+            Outcome::cancelled()
+        } else {
+            Outcome::success(serde_json::Value::Null)
+        }
+    }
+}
+
+struct ResumeQuestionStep;
+
+#[async_trait::async_trait]
+impl Step for ResumeQuestionStep {
+    const NAME: &'static str = "test/resume-question";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        if ctx
+            .logs
+            .send_acked(Question::new("child-wait", "Waiting").to_event())
+            .await
+            .is_err()
+        {
+            return Outcome::failure("could not record the child question");
+        }
+        let fixture = match ctx.require_capability::<Arc<ResumeTimeoutFixture>>() {
+            Ok(fixture) => fixture,
+            Err(error) => return error.into(),
+        };
+        fixture.child_question.notify_one();
+        let _ = ctx.control.recv().await;
+        Outcome::cancelled()
+    }
+}
+
+struct ResumeActiveStep;
+
+#[async_trait::async_trait]
+impl Step for ResumeActiveStep {
+    const NAME: &'static str = "test/resume-active";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        let fixture = match ctx.require_capability::<Arc<ResumeTimeoutFixture>>() {
+            Ok(fixture) => fixture,
+            Err(error) => return error.into(),
+        };
+        fixture.active_child.notify_one();
+        let _ = ctx.control.recv().await;
+        Outcome::cancelled()
+    }
+}
+
+fn resume_timeout_runtime(dir: &RunDir, fixture: Arc<ResumeTimeoutFixture>) -> Runtime {
+    runtime(dir)
+        .step(ResumeParentStep)
+        .step(ResumeQuestionStep)
+        .step(ResumeActiveStep)
+        .capability(fixture)
+}
+
+fn digest(graph: &Graph) -> GraphDigest {
+    GraphDigest::of(
+        serde_json::to_string(graph)
+            .expect("a graph encodes")
+            .as_bytes(),
+    )
 }
 
 /// The reason the breaker blocked a route, if it did.
@@ -806,6 +939,135 @@ async fn active_runtime_and_live_work_are_restored_on_resume() {
         Some(RunTimeout::MaximumActiveDuration(timeout))
             if timeout.maximum_active_duration_ms == 900
                 && timeout.active_duration_ms >= 900
+    ));
+}
+
+struct DelayActiveRedispatch {
+    watchdog: RunWatchdog,
+    delayed:  AtomicBool,
+    parked:   AtomicBool,
+}
+
+impl ExecutionObserver for DelayActiveRedispatch {
+    fn on_engine_record(&self, _: ExecutionId, _: &EventRecord, _: u64, _: &EngineState) {}
+
+    fn on_lifecycle(&self, _: &CoordinatorRecord) {}
+
+    fn on_execution_resumed(&self, _: ExecutionId, state: &EngineState) {
+        let has_question = state.log.records().iter().any(|record| {
+            matches!(
+                &record.event,
+                Event::StepProgressRecorded { ev, .. }
+                    if Question::from_event(ev).is_some()
+            )
+        });
+        if !has_question && !self.delayed.swap(true, Ordering::SeqCst) {
+            sleep_thread(Duration::from_millis(400));
+            self.parked
+                .store(self.watchdog.timeout_reason().is_none(), Ordering::SeqCst);
+        }
+    }
+}
+
+/// Recovery preparation for one execution cannot make another restored
+/// execution's pending question consume either timeout budget. This exercises
+/// the coordinator's actual resume callbacks and delays the active sibling
+/// immediately before its watchdog callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_questions_stay_parked_during_sibling_recovery() {
+    let dir = RunDir::new("watchdog-resume-question-sibling");
+    let fixture = Arc::new(ResumeTimeoutFixture::default());
+
+    let mut question = GraphBuilder::bare();
+    let scope = question.add_scope(Scope::new(ScopeId::new(0)));
+    question.add_step("question", scope, ResumeQuestionStep::NAME);
+    let question = question.build();
+
+    let mut active = GraphBuilder::bare();
+    let scope = active.add_scope(Scope::new(ScopeId::new(0)));
+    active.add_step("active", scope, ResumeActiveStep::NAME);
+    let active = active.build();
+
+    let mut parent = GraphBuilder::bare();
+    let scope = parent.add_scope(Scope::new(ScopeId::new(0)));
+    parent.add_node(
+        "parent",
+        scope,
+        StepRef::new(
+            ResumeParentStep::NAME,
+            json!({
+                "question": digest(&question),
+                "active": digest(&active),
+            }),
+        ),
+    );
+    let parent = parent.build();
+
+    let initial = RunWatchdog::with_limits(None, None);
+    let (handle_tx, handle_rx) = oneshot::channel();
+    let first_rt = resume_timeout_runtime(&dir, fixture.clone());
+    let first_watchdog = initial.clone();
+    let first = tokio::spawn(async move {
+        host::run_configured(
+            &first_rt,
+            HostRun::new(parent)
+                .with_children(vec![question, active])
+                .observe(Arc::new(first_watchdog)),
+            |handle, _| {
+                let _ = handle_tx.send(handle);
+            },
+        )
+        .await
+    });
+    let handle = handle_rx.await.expect("the coordinator handle");
+    fixture.root_question.notified().await;
+    fixture.child_question.notified().await;
+    fixture.active_child.notified().await;
+
+    let state = initial.state();
+    assert_eq!(state.running.len(), 3, "parent and both children are live");
+    assert_eq!(
+        state.questions.len(),
+        2,
+        "the parent and question child are parked"
+    );
+    assert!(handle.checkpoint_timeout(state).await);
+    first.abort();
+    let _ = first.await;
+
+    let resumed = RunWatchdog::with_limits(None, Some(Duration::from_millis(150)));
+    let delay = Arc::new(DelayActiveRedispatch {
+        watchdog: resumed.clone(),
+        delayed:  AtomicBool::new(false),
+        parked:   AtomicBool::new(false),
+    });
+    let rt = resume_timeout_runtime(&dir, fixture);
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(5),
+        host::resume_configured(
+            &rt,
+            Vec::new(),
+            vec![delay.clone(), Arc::new(resumed.clone())],
+            |handle, _| task = Some(resumed.start(handle)),
+        ),
+    )
+    .await
+    .expect("resume and timeout cleanup are bounded")
+    .expect("the run resumes");
+    task.expect("watchdog started").stop().await;
+
+    assert!(delay.delayed.load(Ordering::SeqCst));
+    assert!(
+        delay.parked.load(Ordering::SeqCst),
+        "the restored questions parked both clocks during sibling recovery"
+    );
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        resumed.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 150
+                && timeout.active_duration_ms >= 150
     ));
 }
 

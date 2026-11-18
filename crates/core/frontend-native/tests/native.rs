@@ -49,6 +49,18 @@ fn run_timeout_policy_defaults_overrides_and_disables() {
     );
     assert_eq!(disabled.policy.stall_timeout, None);
     assert_eq!(disabled.policy.max_active_duration, None);
+
+    let boundary = lower_ok(
+        "policy:\n  max_active_duration: 18446744073709551615ms\nnodes:\n  work:\n    run: true\n",
+    );
+    assert_eq!(
+        boundary
+            .policy
+            .max_active_duration
+            .expect("the exact u64 millisecond boundary")
+            .as_millis(),
+        u128::from(u64::MAX)
+    );
 }
 
 #[test]
@@ -56,6 +68,7 @@ fn malformed_negative_and_overflowing_run_durations_are_rejected() {
     for value in [
         "later",
         "-1s",
+        "18446744073709551616ms",
         "18446744073709551616s",
         "18446744073709551615",
     ] {
