@@ -1,6 +1,8 @@
 //! Handoff §7 test 7: the native format reaches the whole engine, and the
 //! invariant-8 error reads as a hint rather than an accident.
 
+use std::time::Duration;
+
 use frontend::Severity;
 use frontend_native::load;
 use ir::JoinPolicy;
@@ -19,6 +21,47 @@ fn lower_ok(text: &str) -> ir::Graph {
 
 fn diagnostics(text: &str) -> Vec<frontend::Diagnostic> {
     load("test.yml", text).diagnostics.into_vec()
+}
+
+#[test]
+fn run_timeout_policy_defaults_overrides_and_disables() {
+    let defaults = lower_ok("nodes:\n  work:\n    run: true\n");
+    assert_eq!(
+        defaults.policy.stall_timeout,
+        Some(Duration::from_secs(10 * 60))
+    );
+    assert_eq!(
+        defaults.policy.max_active_duration,
+        Some(Duration::from_secs(90 * 60))
+    );
+
+    let explicit = lower_ok(
+        "policy:\n  stall_timeout: 45s\n  max_active_duration: 2h\nnodes:\n  work:\n    run: true\n",
+    );
+    assert_eq!(explicit.policy.stall_timeout, Some(Duration::from_secs(45)));
+    assert_eq!(
+        explicit.policy.max_active_duration,
+        Some(Duration::from_secs(2 * 60 * 60))
+    );
+
+    let disabled = lower_ok(
+        "policy:\n  stall_timeout: 0s\n  max_active_duration: 0\nnodes:\n  work:\n    run: true\n",
+    );
+    assert_eq!(disabled.policy.stall_timeout, None);
+    assert_eq!(disabled.policy.max_active_duration, None);
+}
+
+#[test]
+fn malformed_negative_and_overflowing_run_durations_are_rejected() {
+    for value in ["later", "-1s", "18446744073709551616s"] {
+        let diags = diagnostics(&format!(
+            "policy:\n  max_active_duration: {value}\nnodes:\n  work:\n    run: true\n"
+        ));
+        assert!(
+            diags.iter().any(|diag| diag.code == "native.bad_duration"),
+            "{value}: {diags:?}"
+        );
+    }
 }
 
 const CYCLE_XOR_ANY: &str = r#"

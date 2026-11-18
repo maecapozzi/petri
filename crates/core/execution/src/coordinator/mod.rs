@@ -24,7 +24,7 @@ use tokio::task::{JoinError, JoinSet};
 
 use self::gate::{AdmittedSlot, ForkGate, GateKey};
 pub use self::handle::CoordinatorHandle;
-use self::handle::{ControlRequest, PauseRequest};
+use self::handle::{ControlRequest, PauseRequest, TimeoutRequest};
 use self::leases::{ExecutionLeases, InvocationReleased, validate_resources};
 use self::live::LiveInvocations;
 use self::result::{project_result, rebuild_middleware};
@@ -193,6 +193,8 @@ pub struct Coordinator {
     control_rx:       mpsc::UnboundedReceiver<ControlRequest>,
     pause_tx:         mpsc::UnboundedSender<PauseRequest>,
     pause_rx:         mpsc::UnboundedReceiver<PauseRequest>,
+    timeout_tx:       mpsc::Sender<TimeoutRequest>,
+    timeout_rx:       mpsc::Receiver<TimeoutRequest>,
     admit_tx:         mpsc::UnboundedSender<AdmittedSlot>,
     admit_rx:         mpsc::UnboundedReceiver<AdmittedSlot>,
     /// The status of every invocation a start request attached to; it
@@ -355,6 +357,7 @@ impl Coordinator {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (pause_tx, pause_rx) = mpsc::unbounded_channel();
+        let (timeout_tx, timeout_rx) = mpsc::channel(1);
         let (admit_tx, admit_rx) = mpsc::unbounded_channel();
         // The records are the executor's ledger from here on: every
         // container scope it allocates is written here before it exists.
@@ -375,6 +378,8 @@ impl Coordinator {
             control_rx,
             pause_tx,
             pause_rx,
+            timeout_tx,
+            timeout_rx,
             admit_tx,
             admit_rx,
             statuses: BTreeMap::new(),
@@ -668,6 +673,11 @@ impl Coordinator {
                 request = self.pause_rx.recv() => {
                     if let Some(request) = request {
                         self.handle_pause(request).await?;
+                    }
+                }
+                request = self.timeout_rx.recv() => {
+                    if let Some(request) = request {
+                        self.handle_timeout(request).await?;
                     }
                 }
                 request = self.control_rx.recv() => {
@@ -1095,6 +1105,10 @@ impl Coordinator {
                         message: error.to_string(),
                     }
                 })?;
+            }
+            let resumed_state = engine::replay((*graph).clone(), &decoded.log);
+            for observer in &self.observers {
+                observer.on_execution_resumed(execution, &resumed_state);
             }
             let high_water = decoded.log.len() as u64;
             let writer = Arc::new(ExecutionLogWriter::new(

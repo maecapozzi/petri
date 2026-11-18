@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::time::Duration;
 
 use frontend::diag::{Diagnostics, Lowered, Span};
 use frontend::expr::lower::{LowerError, Roots, strict};
@@ -10,17 +11,20 @@ use frontend::yaml::{Document, Mapping, Node};
 use ir::placeholder::EXPR_PLACEHOLDER_KEY;
 use ir::{
     Arm, Backoff, Budget, ExpandTarget, ExprId, ExprOrValue, ExprTable, Fallthrough, GraphBuilder,
-    JoinPolicy, NodeId, RetryOn, RetryPolicy, RuntimeSpec, Scope, ScopeId, StatusKind, StepRef,
-    WorkspacePolicy,
+    JoinPolicy, NodeId, RetryOn, RetryPolicy, RunPolicy, RuntimeSpec, Scope, ScopeId, StatusKind,
+    StepRef, WorkspacePolicy,
 };
 use serde_json::{Map, Value};
 use smol_str::SmolStr;
 
 use crate::duration;
 use crate::model::{
-    ARM_KEYS, BACKOFF_KEYS, BUDGET_KEYS, FOR_EACH_KEYS, KNOWN_BINDINGS, NODE_KEYS, RETRY_KEYS,
-    RETRY_ON_KEYS, SCOPE_KEYS, TOP_KEYS,
+    ARM_KEYS, BACKOFF_KEYS, BUDGET_KEYS, FOR_EACH_KEYS, KNOWN_BINDINGS, NODE_KEYS, POLICY_KEYS,
+    RETRY_KEYS, RETRY_ON_KEYS, SCOPE_KEYS, TOP_KEYS,
 };
+
+const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_MAX_ACTIVE_DURATION: Duration = Duration::from_secs(90 * 60);
 
 /// Resolves identifiers for the native format: engine bindings by name, with
 /// `item` / `index` rewritten to the loop-state shape inside a sequential body.
@@ -84,6 +88,7 @@ pub fn lower(doc: &Document, diags: Diagnostics) -> Lowered {
     top.reject_unknown_keys(TOP_KEYS, &mut ctx.diags, "the document");
 
     ctx.params(top.get("params"));
+    ctx.policy(top.get("policy"));
     ctx.scopes(top.get("scopes"));
 
     let Some(nodes) = top.get("nodes") else {
@@ -215,6 +220,60 @@ impl Ctx<'_> {
             .graph_mut()
             .params
             .insert(SmolStr::new("params"), value);
+    }
+
+    fn policy(&mut self, node: Option<Node<'_>>) {
+        let mut policy = RunPolicy {
+            stall_timeout: Some(DEFAULT_STALL_TIMEOUT),
+            max_active_duration: Some(DEFAULT_MAX_ACTIVE_DURATION),
+            ..RunPolicy::default()
+        };
+        let Some(node) = node else {
+            self.b.graph_mut().policy = policy;
+            return;
+        };
+        let Some(mapping) = node.expect_mapping(&mut self.diags, "`policy`") else {
+            return;
+        };
+        mapping.reject_unknown_keys(POLICY_KEYS, &mut self.diags, "`policy`");
+        policy.stall_timeout =
+            self.policy_duration(&mapping, "stall_timeout", DEFAULT_STALL_TIMEOUT);
+        policy.max_active_duration =
+            self.policy_duration(&mapping, "max_active_duration", DEFAULT_MAX_ACTIVE_DURATION);
+        self.b.graph_mut().policy = policy;
+    }
+
+    fn policy_duration(
+        &mut self,
+        mapping: &Mapping<'_>,
+        key: &str,
+        default: Duration,
+    ) -> Option<Duration> {
+        let Some(node) = mapping.get(key) else {
+            return Some(default);
+        };
+        let Some(value) = node.as_scalar().map(|scalar| scalar.as_str()) else {
+            self.diags.error(
+                "native.bad_duration",
+                node.span(),
+                format!("`policy.{key}` must be a duration"),
+            );
+            return None;
+        };
+        match duration::parse(value) {
+            Some(zero) if zero.is_zero() => None,
+            Some(value) => Some(value),
+            None => {
+                self.diags.error(
+                    "native.bad_duration",
+                    node.span(),
+                    format!(
+                        "`policy.{key}` must be a non-negative duration such as `10m` or `90m`"
+                    ),
+                );
+                None
+            }
+        }
     }
 
     fn scopes(&mut self, node: Option<Node<'_>>) {

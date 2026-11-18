@@ -1035,11 +1035,17 @@ impl<S> GraphBody<S> {
 /// routing or the log, only when a run is cancelled or a route is blocked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunPolicy {
-    /// Cancel the run after this long with no execution event at all. A
-    /// pending human question parks the clock, and so does a pause until its
-    /// unpause. `None` disables the watchdog.
+    /// Cancel the run after this long with no meaningful execution activity.
+    /// A pause parks the clock. Human questions park it only when every
+    /// running firing is waiting for a person. `None` disables the watchdog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_timeout:                Option<Duration>,
+    /// Cancel the run after this much active execution time, even when work
+    /// continues to report progress. Queue time, pauses, and periods where
+    /// every running firing waits on a person do not count. `None` disables
+    /// the active-runtime backstop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_duration:          Option<Duration>,
     /// How many times one node may fail with the same deterministic or
     /// structural failure signature before the run fails, and how many times
     /// one restart edge may be taken for the same signature before it is

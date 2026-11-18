@@ -523,6 +523,7 @@ fn kind_of(record: &CoordinatorRecord) -> &'static str {
         CoordinatorEvent::RunNoteRecorded { .. } => "run.note.recorded",
         CoordinatorEvent::RunPaused => "run.paused",
         CoordinatorEvent::RunUnpaused => "run.unpaused",
+        CoordinatorEvent::RunTimeoutUpdated { .. } => "run.timeout.updated",
     }
 }
 

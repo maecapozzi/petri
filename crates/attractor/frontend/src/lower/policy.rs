@@ -1,10 +1,11 @@
-//! Host policies a Fabro graph declares: the stall watchdog, the failure
+//! Host policies a Fabro graph declares: the run watchdog, the failure
 //! circuit breaker, and which side enforces each node's timeout.
 //!
 //! These attributes never change routing. They become [`ir::RunPolicy`] on
 //! the graph and [`ir::TimeoutPolicy`] on each node's budget, and the host
 //! (the driver, the coordinator) enforces them. Fabro's defaults apply: a
-//! 30 minute stall budget, three repeats of one failure signature.
+//! 10 minute inactivity budget, 90 minute active-runtime backstop, and three
+//! repeats of one failure signature.
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -16,7 +17,10 @@ use super::Kind;
 use crate::model::{NodeDecl, Workflow};
 
 /// Fabro's default `stall_timeout`.
-pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Fabro's default `max_active_duration`.
+pub(crate) const DEFAULT_MAX_ACTIVE_DURATION: Duration = Duration::from_secs(90 * 60);
 
 /// Fabro's default `loop_restart_signature_limit`.
 pub const DEFAULT_SIGNATURE_LIMIT: u32 = 3;
@@ -26,14 +30,20 @@ pub const DEFAULT_SIGNATURE_LIMIT: u32 = 3;
 /// included. The coordinator's hard ceiling; a Fabro run uses all of it.
 pub const MAX_INVOCATIONS: u32 = 10_000;
 
-/// The graph's run policy from its attributes. `stall_timeout=0` disables
-/// the watchdog; a `loop_restart_signature_limit` below 1 is refused.
+/// The graph's run policy from its attributes. A zero duration disables its
+/// clock; a `loop_restart_signature_limit` below 1 is refused.
 pub(super) fn run_policy(workflow: &Workflow, diags: &mut Diagnostics) -> RunPolicy {
     let stall_timeout = match workflow.attrs.duration("stall_timeout", diags) {
         Some(zero) if zero.is_zero() => None,
         Some(explicit) => Some(explicit),
         None if workflow.attrs.contains("stall_timeout") => None,
         None => Some(DEFAULT_STALL_TIMEOUT),
+    };
+    let max_active_duration = match workflow.attrs.duration("max_active_duration", diags) {
+        Some(zero) if zero.is_zero() => None,
+        Some(explicit) => Some(explicit),
+        None if workflow.attrs.contains("max_active_duration") => None,
+        None => Some(DEFAULT_MAX_ACTIVE_DURATION),
     };
     let limit = match workflow.attrs.int("loop_restart_signature_limit", diags) {
         Some(limit) => {
@@ -54,6 +64,7 @@ pub(super) fn run_policy(workflow: &Workflow, diags: &mut Diagnostics) -> RunPol
     };
     RunPolicy {
         stall_timeout,
+        max_active_duration,
         loop_restart_signature_limit: limit,
         max_invocations: NonZeroU32::new(MAX_INVOCATIONS),
     }

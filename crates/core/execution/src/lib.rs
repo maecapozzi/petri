@@ -37,8 +37,8 @@ pub use coordinator::{
 };
 pub use event::{
     AttemptAdmission, COORDINATOR_FORMAT_VERSION, CancelReason, CancelRequest, CoordinatorEvent,
-    CoordinatorRecord, InvocationResult, InvocationStatus, SandboxBinding, SandboxMode,
-    SecretBinding, SecretBindings,
+    CoordinatorRecord, InvocationResult, InvocationStatus, RunTimeoutQuestion, RunTimeoutState,
+    RunTimeoutWork, SandboxBinding, SandboxMode, SecretBinding, SecretBindings,
 };
 pub use id::{
     CallSite, ExecutionId, ExecutionIdentity, GraphDigest, InvocationId, ParentCallKey,

@@ -275,6 +275,7 @@ fn keeps(
         CoordinatorEvent::RunStarted { .. }
         | CoordinatorEvent::RunPaused
         | CoordinatorEvent::RunUnpaused
+        | CoordinatorEvent::RunTimeoutUpdated { .. }
         | CoordinatorEvent::RunNoteRecorded { .. }
         | CoordinatorEvent::ScopeReleased { .. }
         | CoordinatorEvent::RunFinished { .. } => false,

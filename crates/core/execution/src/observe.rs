@@ -40,6 +40,14 @@ pub trait ExecutionObserver: Send + Sync {
         let _ = state;
     }
 
+    /// The replayed state of one unfinished execution, immediately before
+    /// its driver is resumed. This lets observers reconcile state derived
+    /// from engine records that may be newer than their last run-level
+    /// checkpoint. It is not called for a new execution.
+    fn on_execution_resumed(&self, execution: ExecutionId, state: &EngineState) {
+        let _ = (execution, state);
+    }
+
     /// Resolve once every record of `execution` this observer has been
     /// handed through `seq` is in its durable storage: the per-execution
     /// form of [`EventObserver::durable`], awaited by the driver for a

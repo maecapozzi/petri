@@ -23,7 +23,8 @@ pub(crate) const KNOWN_BINDINGS: &[&str] = &[
 ];
 
 /// Keys the format understands at each level, for unknown-key rejection.
-pub(crate) const TOP_KEYS: &[&str] = &["name", "params", "scopes", "entry", "nodes"];
+pub(crate) const TOP_KEYS: &[&str] = &["name", "params", "policy", "scopes", "entry", "nodes"];
+pub(crate) const POLICY_KEYS: &[&str] = &["stall_timeout", "max_active_duration"];
 pub(crate) const SCOPE_KEYS: &[&str] = &["runtime", "requirements", "env", "workspace", "grace"];
 pub(crate) const NODE_KEYS: &[&str] = &[
     "scope", "step", "run", "shell", "config", "join", "if", "budget", "retry", "next", "select",

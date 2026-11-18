@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use engine::{EngineExit, EngineStart, EventOrigin, MiddlewareKey};
 use executor::ScopeOutcome;
-use ir::{FailureInfo, RunStatus, ScopeId, Value, WorkspaceId};
+use ir::{FailureInfo, FiringId, RunStatus, ScopeId, Value, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use store::RunKey;
@@ -100,11 +100,49 @@ pub enum CancelReason {
         stall_timeout_ms: u64,
         idle_ms:          u64,
     },
+    /// The run consumed its configured maximum active execution time.
+    MaximumActiveDuration {
+        maximum_active_duration_ms: u64,
+        active_duration_ms:         u64,
+    },
     /// An interrupt from the terminal (Ctrl-C).
     Interrupt,
     /// A run control: the control service, a control file, an embedding
     /// host.
     Control,
+}
+
+/// One firing considered active by the run timeout policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RunTimeoutWork {
+    pub execution: ExecutionId,
+    pub firing:    FiringId,
+}
+
+/// One unanswered question belonging to active work.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RunTimeoutQuestion {
+    pub execution: ExecutionId,
+    pub firing:    FiringId,
+    pub question:  String,
+}
+
+/// Durable accounting for the run timeout policy.
+///
+/// Old runs have no value and resume with zero accumulated time. Their stored
+/// policy remains authoritative, so no timeout is enabled merely by reading
+/// an old run. Durations advance only while a watchdog process is observing
+/// active work; wall-clock downtime is never inferred.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTimeoutState {
+    pub active_duration_ms: u64,
+    pub idle_duration_ms:   u64,
+    #[serde(default)]
+    pub started:            bool,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub running:            BTreeSet<RunTimeoutWork>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub questions:          BTreeSet<RunTimeoutQuestion>,
 }
 
 /// One cancel request on the coordinator's channel.
@@ -219,6 +257,11 @@ pub enum CoordinatorEvent {
     /// format version 2.
     #[serde(rename = "run.unpaused")]
     RunUnpaused,
+    /// A checkpoint of the native run timeout clocks and structural work
+    /// state. Additive in coordinator format 9: logs without it have no
+    /// accumulated time, and replay does not infer any.
+    #[serde(rename = "run.timeout.updated")]
+    RunTimeoutUpdated { state: RunTimeoutState },
     /// A note from a run-level hook point (`run_finished`, `scope_released`):
     /// no firing owns it, so it lives beside the run, appended from the
     /// execution's report before `RunFinished`. Additive since format

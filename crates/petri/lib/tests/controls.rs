@@ -20,7 +20,7 @@ use petri::execution::events::{
 };
 use petri::execution::host::{self, HostRun};
 use petri::execution::inspect::inspect_run_dir;
-use petri::execution::watchdog::{StallWatchdog, WatchdogTask};
+use petri::execution::watchdog::{RunTimeout, RunWatchdog, StallWatchdog, WatchdogTask};
 use petri::execution::{
     CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, ExecutionObserver,
     InterviewDispatcher, InterviewReply, InterviewRequest, Interviewer,
@@ -456,7 +456,15 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
     let receipt = projector.shutdown().await;
     assert!(receipt.is_clean(), "{receipt:?}");
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(report.status, RunStatus::Cancelled);
+    assert_eq!(
+        report.status,
+        RunStatus::Cancelled,
+        "exit={:?}, errors={:?}, history={:?}, releases={:?}",
+        report.exit,
+        report.state.errors(),
+        report.state.history(),
+        report.releases
+    );
     let stall = watchdog.tripped().expect("the watchdog fired");
     assert_eq!(stall.stall_timeout_ms, 400);
     assert!(stall.idle_ms >= 400);
@@ -495,6 +503,171 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
             .any(|e| matches!(e.view(), Some(ViewEvent::RunStalled { .. }))),
         "the stall survives replay"
     );
+}
+
+/// Meaningful output keeps inactivity fresh, but cannot reset the independent
+/// maximum active-runtime backstop. Cancellation still follows the native
+/// coordinator path and is replayable.
+#[tokio::test]
+async fn continuous_progress_is_cancelled_at_the_maximum_active_duration() {
+    const BUSY: &str = r#"digraph G {
+        graph [stall_timeout="100ms", max_active_duration="300ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        long [shape=parallelogram, script="while true; do echo working; sleep 0.02; done"]
+        start -> long -> exit
+    }"#;
+    let dir = RunDir::new("watchdog-maximum-active");
+    let rt = runtime(&dir);
+    let graph = lower(&rt, &dir, BUSY).graph.expect("lowers");
+    let watchdog =
+        RunWatchdog::with_limits(graph.policy.stall_timeout, graph.policy.max_active_duration);
+    let sink = Arc::new(CollectingSink::default());
+    let projector = EventProjector::new(sink.clone());
+    let host_run = HostRun::new(graph)
+        .observe(Arc::new(watchdog.clone()))
+        .observe(projector.clone() as Arc<dyn ExecutionObserver>);
+    let mut task = None;
+    let report = host::run_configured(&rt, host_run, |handle, _| {
+        task = Some(watchdog.start(handle));
+    })
+    .await
+    .expect("the run completes");
+    task.expect("started").stop().await;
+    let receipt = projector.shutdown().await;
+    assert!(receipt.is_clean(), "{receipt:?}");
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 300
+                && timeout.active_duration_ms >= 300
+    ));
+
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event.coordinator(),
+        Some(CoordinatorEvent::InvocationCancelRequested {
+            reason: Some(CancelReason::MaximumActiveDuration {
+                maximum_active_duration_ms: 300,
+                active_duration_ms,
+            }),
+            ..
+        }) if *active_duration_ms >= 300
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event.view(),
+        Some(ViewEvent::RunMaximumActiveDurationExceeded {
+            maximum_active_duration_ms: 300,
+            active_duration_ms,
+        }) if *active_duration_ms >= 300
+    )));
+    let replayed = replay_run_dir(dir.path()).await.expect("replays");
+    assert!(replayed.iter().any(|event| matches!(
+        event.view(),
+        Some(ViewEvent::RunMaximumActiveDurationExceeded { .. })
+    )));
+}
+
+/// A resumed live firing is reconstructed from its engine log even when the
+/// latest timeout checkpoint was written after that firing finished. Its
+/// accumulated active time is retained, so redispatch cannot buy a fresh
+/// maximum-duration budget.
+#[tokio::test]
+async fn active_runtime_and_live_work_are_restored_on_resume() {
+    const FINITE: &str = r#"digraph G {
+        graph [stall_timeout="100ms", max_active_duration="900ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        long [shape=parallelogram, script="i=0; while [ $i -lt 30 ]; do echo working; sleep 0.02; i=$((i+1)); done"]
+        start -> long -> exit
+    }"#;
+    let dir = RunDir::new("watchdog-resume-active");
+    let rt = runtime(&dir);
+    let mut options = rt.run_options().clone();
+    options.retention = Retention::Always;
+    let rt = rt.options(options);
+    let graph = lower(&rt, &dir, FINITE).graph.expect("lowers");
+    let first =
+        RunWatchdog::with_limits(graph.policy.stall_timeout, graph.policy.max_active_duration);
+    let mut first_task = None;
+    let report = host::run_configured(
+        &rt,
+        HostRun::new(graph).observe(Arc::new(first.clone())),
+        |handle, _| first_task = Some(first.start(handle)),
+    )
+    .await
+    .expect("the first lifetime completes");
+    first_task.expect("started").stop().await;
+    assert_eq!(report.status, RunStatus::Success);
+    assert!(first.state().active_duration_ms >= 500);
+
+    let events = fs::read_dir(dir.path().join("executions"))
+        .unwrap_or_else(|error| {
+            let entries: Vec<_> = fs::read_dir(dir.path())
+                .expect("run directory")
+                .map(|entry| entry.expect("run entry").file_name())
+                .collect();
+            panic!("executions: {error}; run entries: {entries:?}")
+        })
+        .next()
+        .expect("one execution")
+        .expect("execution entry")
+        .path()
+        .join("events.jsonl");
+    let text = fs::read_to_string(&events).expect("engine log");
+    let lines: Vec<&str> = text.lines().collect();
+    let cut = lines
+        .iter()
+        .position(|line| line.contains("\"step.finished\""))
+        .expect("the command's finish record");
+    fs::write(&events, format!("{}\n", lines[..cut].join("\n"))).expect("truncate engine log");
+
+    let coordinator = dir.path().join("coordinator.jsonl");
+    let text = fs::read_to_string(&coordinator).expect("coordinator log");
+    let lines: Vec<&str> = text.lines().collect();
+    let cut = lines
+        .iter()
+        .position(|line| line.contains("\"execution.finished\""))
+        .expect("the execution finish record");
+    fs::write(&coordinator, format!("{}\n", lines[..cut].join("\n")))
+        .expect("truncate coordinator log");
+
+    let resumed = RunWatchdog::with_limits(
+        Some(Duration::from_millis(100)),
+        Some(Duration::from_millis(900)),
+    );
+    let mut resumed_task = None;
+    let started = Instant::now();
+    let report = host::resume_configured(
+        &rt,
+        Vec::new(),
+        vec![Arc::new(resumed.clone())],
+        |handle, _| resumed_task = Some(resumed.start(handle)),
+    )
+    .await
+    .expect("the run resumes");
+    resumed_task.expect("started").stop().await;
+    assert_eq!(
+        report.status,
+        RunStatus::Cancelled,
+        "exit={:?}, errors={:?}, history={:?}, releases={:?}",
+        report.exit,
+        report.state.errors(),
+        report.state.history(),
+        report.releases
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(550),
+        "resume reset the active budget: {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(
+        resumed.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 900
+                && timeout.active_duration_ms >= 900
+    ));
 }
 
 /// A pause parks the watchdog: a run paused far longer than its stall

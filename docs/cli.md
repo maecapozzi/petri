@@ -229,10 +229,14 @@ an agent node's retained thread. As in Fabro, whose `AgentApiBackend` keeps
 full-fidelity sessions in memory per worker, a node that was mid-turn starts a
 fresh session from the `summary:high` preamble.
 
-**Policies.** A Fabro graph's `stall_timeout` (default 30 minutes) cancels a
-run that emits no execution event for that long; a pending question parks the
-clock, and the terminal prints `stall watchdog: no execution activity for N
-s`. Its `loop_restart_signature_limit` (default 3) fails a run whose node
+**Policies.** A Fabro graph's `stall_timeout` (default 10 minutes) cancels a
+run with no meaningful execution activity for that long.
+`max_active_duration` (default 90 minutes) cancels one that consumes that
+much active execution time even while progress continues. A pause parks both;
+questions park them only when no independent firing remains active. Both
+clocks and their work/question state survive resume. The terminal prints the
+matching native cancellation reason. Its `loop_restart_signature_limit`
+(default 3) fails a run whose node
 repeats one deterministic failure that many times and blocks a `loop_restart`
 edge taken by anything but a transient failure. See `crates/attractor/FORMAT.md`,
 "Watchdog and circuit breaker".

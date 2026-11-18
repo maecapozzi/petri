@@ -31,6 +31,38 @@ nodes:
     run: echo "deploying"
 ```
 
+## Run timeout policy
+
+Newly lowered native workflows use a 10 minute inactivity budget and a 90
+minute maximum active-runtime budget:
+
+```yaml
+policy:
+  stall_timeout: 10m
+  max_active_duration: 90m
+```
+
+Either value accepts the format's duration syntax (`500ms`, `45s`, `10m`,
+`2h`, or a bare number of seconds). `0` explicitly disables that clock.
+Malformed, negative, non-finite, and overflowing values are errors. An
+omitted `policy` or omitted key gets the new-workflow default; the lowered
+graph stores the resulting explicit value.
+
+These are host policies and do not change routing. `stall_timeout` counts
+time without meaningful execution activity. `max_active_duration` counts
+active execution even while progress continues. Both exclude a global
+pause and a human wait when every running firing is waiting for a person;
+an independently running sibling keeps both clocks running. Queue time
+before the first step starts is excluded.
+
+Serialized IR remains backward compatible: a stored graph whose
+`RunPolicy` lacks either field reads that field as disabled. Petri does not
+apply current frontend defaults while replaying an old graph. Likewise, an
+old run with no timeout-accounting event resumes with zero accumulated time;
+Petri reconciles its live work and questions from the engine logs, then
+counts only observed active time after resume. It never invents elapsed time
+for process downtime.
+
 A scope's `runtime` is `host` or `{ container: { image: … } }`, and the
 container form takes only the image. What runs the container, and with which
 flags, is the executor's configuration, not the workflow's; the native format

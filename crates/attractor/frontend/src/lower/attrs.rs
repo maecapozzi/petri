@@ -104,6 +104,7 @@ pub(super) const GRAPH: &[&str] = &[
     "acp.command",
     "acp.config",
     "stall_timeout",
+    "max_active_duration",
     "loop_restart_signature_limit",
 ];
 

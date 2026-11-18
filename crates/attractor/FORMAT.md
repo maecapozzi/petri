@@ -135,9 +135,10 @@ sibling's question never extends another stage's budget. On expiry the driver ca
 through Pebble's prompt cancellation token; Pebble's own wall-clock timer stays
 unset). The attempt is `timed_out` and a retry gets a fresh budget.
 
-Run policies: `stall_timeout` (default 30 m; `0s` disables) is the stall
-watchdog's budget, and `loop_restart_signature_limit` (default 3, at least 1)
-is the failure circuit breaker's limit. Both lower to the graph's
+Run policies: `stall_timeout` (default 10 m; `0s` disables) is the inactivity
+watchdog's budget, `max_active_duration` (default 90 m; `0s` disables) is the
+active-runtime backstop, and `loop_restart_signature_limit` (default 3, at
+least 1) is the failure circuit breaker's limit. All lower to the graph's
 `RunPolicy`; the host enforces them (see "Watchdog and circuit breaker").
 
 Retries: `max_retries` (default `default_max_retries`, default 0) or a
@@ -1523,18 +1524,39 @@ which tooling and hosts use for attributes Petri carries without reading.
 
 ## Watchdog and circuit breaker
 
-Two host policies ride the graph's `RunPolicy` and never change routing on
+Three host policies ride the graph's `RunPolicy` and never change routing on
 their own.
 
-**Stall watchdog** (`stall_timeout`, default 30 m, `0s` disables). The
-standalone host installs `execution::watchdog::StallWatchdog` as an observer.
-Any engine or lifecycle record of any execution is activity. A question
-pending with the host parks the clock: a run waiting on a person is blocked,
-not stalled. When the last pending question is answered the run gets a full
-stall budget again. A pause parks it too, until the unpause, which restarts
-the full budget; a run resumed paused starts parked. A run idle for the whole budget is cancelled through the
-coordinator, and the terminal prints `stall watchdog: no execution activity
-for N s`. This is separate from each attempt's active-work timer.
+**Run watchdog** (`stall_timeout`, default 10 m, and
+`max_active_duration`, default 90 m; `0s` disables either clock). The
+standalone host installs `execution::watchdog::RunWatchdog` as an observer.
+The inactivity clock is refreshed by non-empty process output, artifacts,
+Petri's typed model-execution events, or a host's explicit
+`RunWatchdog::record_activity` call for a typed model/tool event. Coordinator
+records, retries, heartbeats, arbitrary custom payloads, status polling, and
+gather/wait bookkeeping do not refresh it. Hosts must classify their native
+run-management tools before calling the hook; they must not infer activity
+from arbitrary model prose.
+
+The maximum-active-duration clock never resets for ordinary progress. Queue
+time before execution starts is excluded. A global pause parks both clocks.
+Questions park both only when every running firing is waiting for a person;
+an independent sibling keeps them running. The coordinator durably
+checkpoints accumulated milliseconds plus running firings and pending
+questions. On resume the watchdog restores the checkpoint and reconciles it
+with every replayed engine log before work is redispatched. Process downtime
+is not counted.
+
+An inactivity expiry records `CancelReason::StallTimeout`; an active-runtime
+expiry records the distinct `CancelReason::MaximumActiveDuration`, including
+the configured and observed milliseconds. Both use the coordinator's native
+cancellation cascade and bounded driver cleanup. The terminal reports the
+matching reason. This is separate from each attempt's active-work timer.
+
+Stored graphs written before `max_active_duration` read it as disabled, and
+old runs with no timeout checkpoint resume with zero accumulated time. Thus
+replay never gains a new budget or invented elapsed time merely because the
+current frontend has defaults.
 
 **Circuit breaker** (`loop_restart_signature_limit`, default 3, at least 1).
 The standalone host installs `execution::breaker::CircuitBreaker` as routing
