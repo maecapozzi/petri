@@ -523,8 +523,17 @@ async fn host_network_reaches_docker_and_its_one_shots() {
     assert!(mode.status.success());
     assert_eq!(String::from_utf8_lossy(&mode.stdout).trim(), "host");
 
-    let (job_namespace, status) = run_bash(&*handle.exec(), "readlink /proc/self/ns/net").await;
-    assert!(status.is_success());
+    let mut job_process = handle
+        .exec()
+        .spawn(ProcessSpec::new("readlink", &["/proc/self/ns/net"]))
+        .await
+        .expect("read the sandbox network namespace");
+    let mut job_lines = job_process.lines().expect("lines");
+    let mut job_namespace = Vec::new();
+    while let Some(line) = job_lines.recv().await {
+        job_namespace.push(line.line);
+    }
+    assert!(job_process.wait().await.expect("wait").is_success());
     let runner = handle.container_runner().expect("one-shot runner");
     let spec = OneShotContainer::registry(ALPINE)
         .with_entrypoint("sh")
