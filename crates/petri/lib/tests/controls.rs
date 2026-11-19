@@ -7,11 +7,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::sleep as sleep_thread;
 use std::time::{Duration, Instant};
 
 use petri::attractor::{
-    AGENT_KIND, CommandStep, HumanStep, StageStep, StubStep, WAIT_KIND, WORKFLOW_KIND,
+    AGENT_KIND, BranchStep, CommandStep, FanInStep, ForkStep, HumanStep, StageStep, StubStep,
+    WAIT_KIND, WORKFLOW_KIND,
 };
 use petri::engine::{EngineState, Event, EventRecord, RunError};
 use petri::execution::controls::{ControlError, ControlService};
@@ -20,21 +23,27 @@ use petri::execution::events::{
 };
 use petri::execution::host::{self, HostRun};
 use petri::execution::inspect::inspect_run_dir;
-use petri::execution::watchdog::{StallWatchdog, WatchdogTask};
+use petri::execution::watchdog::{RunTimeout, RunWatchdog, StallWatchdog, WatchdogTask};
 use petri::execution::{
-    CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, ExecutionObserver,
-    InterviewDispatcher, InterviewReply, InterviewRequest, Interviewer,
+    CallSite, CancelReason, CoordinatorEvent, CoordinatorInvocationClient, CoordinatorRecord,
+    ExecutionId, ExecutionObserver, GraphDigest, InterviewDispatcher, InterviewReply,
+    InterviewRequest, Interviewer, InvocationClient as _, InvocationRequest, SandboxMode,
+    SecretBindings,
 };
 use petri::executor::Retention;
 use petri::frontend::fabro::Fabro;
 use petri::frontend::{CompileInputs, Lowered};
-use petri::ir::{FiringId, Graph, RunStatus, Status, Value};
-use petri::steps::Answer;
+use petri::ir::{
+    Control, FiringId, Graph, GraphBuilder, Outcome, RunStatus, Scope, ScopeId, Status, StepEvent,
+    StepRef, Value,
+};
+use petri::steps::{Answer, Question, Step, StepCtx};
 use petri::{RunOptions, Runtime, driver};
+use serde::Deserialize;
 use serde_json::json;
 use testkit::RunDir;
-use tokio::sync::Notify;
-use tokio::time::sleep;
+use tokio::sync::{Notify, oneshot};
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 fn runtime(dir: &RunDir) -> Runtime {
@@ -47,6 +56,9 @@ fn runtime(dir: &RunDir) -> Runtime {
         registry.register_runner(Arc::new(StubStep::new((*kind).clone())));
     }
     registry.register(CommandStep);
+    registry.register(ForkStep);
+    registry.register(BranchStep);
+    registry.register(FanInStep);
     registry.register(HumanStep);
     registry.register(StageStep);
     Runtime::standard()
@@ -90,6 +102,134 @@ fn firings_of(report: &driver::ExecutionReport, node: &str) -> usize {
         .iter()
         .filter(|r| r.name == node)
         .count()
+}
+
+#[derive(Default)]
+struct ResumeTimeoutFixture {
+    root_question:  Notify,
+    child_question: Notify,
+    active_child:   Notify,
+}
+
+#[derive(Deserialize)]
+struct ResumeChildren {
+    question: GraphDigest,
+    active:   GraphDigest,
+}
+
+struct ResumeParentStep;
+
+#[async_trait::async_trait]
+impl Step for ResumeParentStep {
+    const NAME: &'static str = "test/resume-parent";
+    type Config = ResumeChildren;
+
+    async fn run(&self, config: ResumeChildren, ctx: StepCtx) -> Outcome {
+        let client = match ctx.require_capability::<CoordinatorInvocationClient>() {
+            Ok(client) => client,
+            Err(error) => return error.into(),
+        };
+        let start = |slot: &str, graph| {
+            client.start_or_attach(InvocationRequest::new(
+                CallSite {
+                    firing:  ctx.firing,
+                    attempt: ctx.attempt,
+                    slot:    slot.into(),
+                },
+                graph,
+                BTreeMap::new(),
+                SecretBindings::None,
+                SandboxMode::Isolated,
+            ))
+        };
+        let mut question = match start("question", config.question).await {
+            Ok(handle) => handle,
+            Err(error) => return Outcome::failure(error.to_string()),
+        };
+        let mut active = match start("active", config.active).await {
+            Ok(handle) => handle,
+            Err(error) => return Outcome::failure(error.to_string()),
+        };
+        if ctx
+            .logs
+            .send_acked(Question::new("root-wait", "Waiting").to_event())
+            .await
+            .is_err()
+        {
+            return Outcome::failure("could not record the parent question");
+        }
+        let fixture = match ctx.require_capability::<Arc<ResumeTimeoutFixture>>() {
+            Ok(fixture) => fixture,
+            Err(error) => return error.into(),
+        };
+        fixture.root_question.notify_one();
+        let (question, active) = tokio::join!(question.result(), active.result());
+        if question.status == RunStatus::Cancelled || active.status == RunStatus::Cancelled {
+            Outcome::cancelled()
+        } else {
+            Outcome::success(serde_json::Value::Null)
+        }
+    }
+}
+
+struct ResumeQuestionStep;
+
+#[async_trait::async_trait]
+impl Step for ResumeQuestionStep {
+    const NAME: &'static str = "test/resume-question";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        if ctx
+            .logs
+            .send_acked(Question::new("child-wait", "Waiting").to_event())
+            .await
+            .is_err()
+        {
+            return Outcome::failure("could not record the child question");
+        }
+        let fixture = match ctx.require_capability::<Arc<ResumeTimeoutFixture>>() {
+            Ok(fixture) => fixture,
+            Err(error) => return error.into(),
+        };
+        fixture.child_question.notify_one();
+        let _ = ctx.control.recv().await;
+        Outcome::cancelled()
+    }
+}
+
+struct ResumeActiveStep;
+
+#[async_trait::async_trait]
+impl Step for ResumeActiveStep {
+    const NAME: &'static str = "test/resume-active";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        let fixture = match ctx.require_capability::<Arc<ResumeTimeoutFixture>>() {
+            Ok(fixture) => fixture,
+            Err(error) => return error.into(),
+        };
+        fixture.active_child.notify_one();
+        let _ = ctx.control.recv().await;
+        Outcome::cancelled()
+    }
+}
+
+fn resume_timeout_runtime(dir: &RunDir, fixture: Arc<ResumeTimeoutFixture>) -> Runtime {
+    runtime(dir)
+        .step(ResumeParentStep)
+        .step(ResumeQuestionStep)
+        .step(ResumeActiveStep)
+        .capability(fixture)
+}
+
+fn digest(graph: &Graph) -> GraphDigest {
+    GraphDigest::of(
+        serde_json::to_string(graph)
+            .expect("a graph encodes")
+            .as_bytes(),
+    )
 }
 
 /// The reason the breaker blocked a route, if it did.
@@ -456,7 +596,15 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
     let receipt = projector.shutdown().await;
     assert!(receipt.is_clean(), "{receipt:?}");
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(report.status, RunStatus::Cancelled);
+    assert_eq!(
+        report.status,
+        RunStatus::Cancelled,
+        "exit={:?}, errors={:?}, history={:?}, releases={:?}",
+        report.exit,
+        report.state.errors(),
+        report.state.history(),
+        report.releases
+    );
     let stall = watchdog.tripped().expect("the watchdog fired");
     assert_eq!(stall.stall_timeout_ms, 400);
     assert!(stall.idle_ms >= 400);
@@ -495,6 +643,432 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
             .any(|e| matches!(e.view(), Some(ViewEvent::RunStalled { .. }))),
         "the stall survives replay"
     );
+}
+
+struct HeartbeatOnly;
+
+#[async_trait::async_trait]
+impl Step for HeartbeatOnly {
+    const NAME: &'static str = "test/heartbeat-only";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        loop {
+            tokio::select! {
+                () = sleep(Duration::from_millis(20)) => {
+                    let _ = ctx
+                        .logs
+                        .send(StepEvent::Custom(json!({"kind": "heartbeat"})))
+                        .await;
+                }
+                control = ctx.control.recv() => match control {
+                    Some(Control::Cancel | Control::Kill) | None => {
+                        return Outcome::cancelled();
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+struct ToolActivityOnly;
+
+#[async_trait::async_trait]
+impl Step for ToolActivityOnly {
+    const NAME: &'static str = "test/tool-activity-only";
+    type Config = ();
+
+    async fn run(&self, (): (), mut ctx: StepCtx) -> Outcome {
+        let started = Instant::now();
+        loop {
+            tokio::select! {
+                () = sleep(Duration::from_millis(50)) => {
+                    let _ = ctx
+                        .logs
+                        .send(StepEvent::Custom(json!({
+                            "kind": "pebble",
+                            "event": {
+                                "event": {
+                                    "ToolCallStarted": {
+                                        "tool_name": "shell"
+                                    }
+                                }
+                            }
+                        })))
+                        .await;
+                    if started.elapsed() >= Duration::from_millis(700) {
+                        return Outcome::success(Value::Null);
+                    }
+                }
+                control = ctx.control.recv() => match control {
+                    Some(Control::Cancel | Control::Kill) | None => {
+                        return Outcome::cancelled();
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Typed heartbeat/status traffic is durable but not meaningful execution
+/// progress, so it cannot keep an otherwise idle run alive.
+#[tokio::test]
+async fn heartbeat_only_traffic_still_expires_as_idle() {
+    let dir = RunDir::new("watchdog-heartbeat-only");
+    let rt = runtime(&dir).step(HeartbeatOnly);
+    let mut builder = GraphBuilder::bare();
+    builder.graph_mut().policy.stall_timeout = Some(Duration::from_millis(300));
+    builder.graph_mut().policy.max_active_duration = None;
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("poll", scope, HeartbeatOnly::NAME);
+    let watchdog = RunWatchdog::with_limits(Some(Duration::from_millis(300)), None);
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(
+            &rt,
+            HostRun::new(builder.build()).observe(Arc::new(watchdog.clone())),
+            |handle, _| task = Some(watchdog.start(handle)),
+        ),
+    )
+    .await
+    .expect("idle timeout and cleanup are bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::Stall(timeout))
+            if timeout.stall_timeout_ms == 300 && timeout.idle_ms >= 300
+    ));
+}
+
+/// Pebble's typed tool lifecycle is real execution activity even when a tool
+/// is otherwise silent, so it refreshes inactivity structurally.
+#[tokio::test]
+async fn typed_tool_activity_refreshes_inactivity() {
+    let dir = RunDir::new("watchdog-tool-activity");
+    let rt = runtime(&dir).step(ToolActivityOnly);
+    let mut builder = GraphBuilder::bare();
+    builder.graph_mut().policy.stall_timeout = Some(Duration::from_millis(300));
+    builder.graph_mut().policy.max_active_duration = None;
+    let scope = builder.add_scope(Scope::new(ScopeId::new(0)));
+    builder.add_step("tool", scope, ToolActivityOnly::NAME);
+    let watchdog = RunWatchdog::with_limits(Some(Duration::from_millis(300)), None);
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(
+            &rt,
+            HostRun::new(builder.build()).observe(Arc::new(watchdog.clone())),
+            |handle, _| task = Some(watchdog.start(handle)),
+        ),
+    )
+    .await
+    .expect("the active tool run is bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+
+    assert_eq!(report.status, RunStatus::Success);
+    assert_eq!(watchdog.timeout_reason(), None);
+    assert!(watchdog.state().active_duration_ms >= 600);
+}
+
+/// Meaningful output keeps inactivity fresh, but cannot reset the independent
+/// maximum active-runtime backstop. Cancellation still follows the native
+/// coordinator path and is replayable.
+#[tokio::test]
+async fn continuous_progress_is_cancelled_at_the_maximum_active_duration() {
+    const BUSY: &str = r#"digraph G {
+        graph [stall_timeout="100ms", max_active_duration="300ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        long [shape=parallelogram, script="while true; do echo working; sleep 0.02; done"]
+        start -> long -> exit
+    }"#;
+    let dir = RunDir::new("watchdog-maximum-active");
+    let rt = runtime(&dir);
+    let graph = lower(&rt, &dir, BUSY).graph.expect("lowers");
+    let watchdog =
+        RunWatchdog::with_limits(graph.policy.stall_timeout, graph.policy.max_active_duration);
+    let sink = Arc::new(CollectingSink::default());
+    let projector = EventProjector::new(sink.clone());
+    let host_run = HostRun::new(graph)
+        .observe(Arc::new(watchdog.clone()))
+        .observe(projector.clone() as Arc<dyn ExecutionObserver>);
+    let mut task = None;
+    let report = host::run_configured(&rt, host_run, |handle, _| {
+        task = Some(watchdog.start(handle));
+    })
+    .await
+    .expect("the run completes");
+    task.expect("started").stop().await;
+    let receipt = projector.shutdown().await;
+    assert!(receipt.is_clean(), "{receipt:?}");
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 300
+                && timeout.active_duration_ms >= 300
+    ));
+
+    let events = sink.events();
+    assert!(events.iter().any(|event| matches!(
+        event.coordinator(),
+        Some(CoordinatorEvent::InvocationCancelRequested {
+            reason: Some(CancelReason::MaximumActiveDuration {
+                maximum_active_duration_ms: 300,
+                active_duration_ms,
+            }),
+            ..
+        }) if *active_duration_ms >= 300
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event.view(),
+        Some(ViewEvent::RunMaximumActiveDurationExceeded {
+            maximum_active_duration_ms: 300,
+            active_duration_ms,
+        }) if *active_duration_ms >= 300
+    )));
+    let replayed = replay_run_dir(dir.path()).await.expect("replays");
+    assert!(replayed.iter().any(|event| matches!(
+        event.view(),
+        Some(ViewEvent::RunMaximumActiveDurationExceeded { .. })
+    )));
+}
+
+/// A resumed live firing is reconstructed from its engine log even when the
+/// latest timeout checkpoint was written after that firing finished. Its
+/// accumulated active time is retained, so redispatch cannot buy a fresh
+/// maximum-duration budget.
+#[tokio::test]
+async fn active_runtime_and_live_work_are_restored_on_resume() {
+    const FINITE: &str = r#"digraph G {
+        graph [stall_timeout="100ms", max_active_duration="900ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        long [shape=parallelogram, script="i=0; while [ $i -lt 30 ]; do echo working; sleep 0.02; i=$((i+1)); done"]
+        start -> long -> exit
+    }"#;
+    let dir = RunDir::new("watchdog-resume-active");
+    let rt = runtime(&dir);
+    let mut options = rt.run_options().clone();
+    options.retention = Retention::Always;
+    let rt = rt.options(options);
+    let graph = lower(&rt, &dir, FINITE).graph.expect("lowers");
+    let first =
+        RunWatchdog::with_limits(graph.policy.stall_timeout, graph.policy.max_active_duration);
+    let mut first_task = None;
+    let report = host::run_configured(
+        &rt,
+        HostRun::new(graph).observe(Arc::new(first.clone())),
+        |handle, _| first_task = Some(first.start(handle)),
+    )
+    .await
+    .expect("the first lifetime completes");
+    first_task.expect("started").stop().await;
+    assert_eq!(report.status, RunStatus::Success);
+    assert!(first.state().active_duration_ms >= 500);
+
+    let events = fs::read_dir(dir.path().join("executions"))
+        .unwrap_or_else(|error| {
+            let entries: Vec<_> = fs::read_dir(dir.path())
+                .expect("run directory")
+                .map(|entry| entry.expect("run entry").file_name())
+                .collect();
+            panic!("executions: {error}; run entries: {entries:?}")
+        })
+        .next()
+        .expect("one execution")
+        .expect("execution entry")
+        .path()
+        .join("events.jsonl");
+    let text = fs::read_to_string(&events).expect("engine log");
+    let lines: Vec<&str> = text.lines().collect();
+    let cut = lines
+        .iter()
+        .position(|line| line.contains("\"step.finished\""))
+        .expect("the command's finish record");
+    fs::write(&events, format!("{}\n", lines[..cut].join("\n"))).expect("truncate engine log");
+
+    let coordinator = dir.path().join("coordinator.jsonl");
+    let text = fs::read_to_string(&coordinator).expect("coordinator log");
+    let lines: Vec<&str> = text.lines().collect();
+    let cut = lines
+        .iter()
+        .position(|line| line.contains("\"execution.finished\""))
+        .expect("the execution finish record");
+    fs::write(&coordinator, format!("{}\n", lines[..cut].join("\n")))
+        .expect("truncate coordinator log");
+
+    let resumed = RunWatchdog::with_limits(
+        Some(Duration::from_millis(100)),
+        Some(Duration::from_millis(900)),
+    );
+    let mut resumed_task = None;
+    let started = Instant::now();
+    let report = host::resume_configured(
+        &rt,
+        Vec::new(),
+        vec![Arc::new(resumed.clone())],
+        |handle, _| resumed_task = Some(resumed.start(handle)),
+    )
+    .await
+    .expect("the run resumes");
+    resumed_task.expect("started").stop().await;
+    assert_eq!(
+        report.status,
+        RunStatus::Cancelled,
+        "exit={:?}, errors={:?}, history={:?}, releases={:?}",
+        report.exit,
+        report.state.errors(),
+        report.state.history(),
+        report.releases
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(550),
+        "resume reset the active budget: {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(
+        resumed.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 900
+                && timeout.active_duration_ms >= 900
+    ));
+}
+
+struct DelayActiveRedispatch {
+    watchdog: RunWatchdog,
+    delayed:  AtomicBool,
+    parked:   AtomicBool,
+}
+
+impl ExecutionObserver for DelayActiveRedispatch {
+    fn on_engine_record(&self, _: ExecutionId, _: &EventRecord, _: u64, _: &EngineState) {}
+
+    fn on_lifecycle(&self, _: &CoordinatorRecord) {}
+
+    fn on_execution_resumed(&self, _: ExecutionId, state: &EngineState) {
+        let has_question = state.log.records().iter().any(|record| {
+            matches!(
+                &record.event,
+                Event::StepProgressRecorded { ev, .. }
+                    if Question::from_event(ev).is_some()
+            )
+        });
+        if !has_question && !self.delayed.swap(true, Ordering::SeqCst) {
+            sleep_thread(Duration::from_millis(400));
+            self.parked
+                .store(self.watchdog.timeout_reason().is_none(), Ordering::SeqCst);
+        }
+    }
+}
+
+/// Recovery preparation for one execution cannot make another restored
+/// execution's pending question consume either timeout budget. This exercises
+/// the coordinator's actual resume callbacks and delays the active sibling
+/// immediately before its watchdog callback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restored_questions_stay_parked_during_sibling_recovery() {
+    let dir = RunDir::new("watchdog-resume-question-sibling");
+    let fixture = Arc::new(ResumeTimeoutFixture::default());
+
+    let mut question = GraphBuilder::bare();
+    let scope = question.add_scope(Scope::new(ScopeId::new(0)));
+    question.add_step("question", scope, ResumeQuestionStep::NAME);
+    let question = question.build();
+
+    let mut active = GraphBuilder::bare();
+    let scope = active.add_scope(Scope::new(ScopeId::new(0)));
+    active.add_step("active", scope, ResumeActiveStep::NAME);
+    let active = active.build();
+
+    let mut parent = GraphBuilder::bare();
+    let scope = parent.add_scope(Scope::new(ScopeId::new(0)));
+    parent.add_node(
+        "parent",
+        scope,
+        StepRef::new(
+            ResumeParentStep::NAME,
+            json!({
+                "question": digest(&question),
+                "active": digest(&active),
+            }),
+        ),
+    );
+    let parent = parent.build();
+
+    let initial = RunWatchdog::with_limits(None, None);
+    let (handle_tx, handle_rx) = oneshot::channel();
+    let first_rt = resume_timeout_runtime(&dir, fixture.clone());
+    let first_watchdog = initial.clone();
+    let first = tokio::spawn(async move {
+        host::run_configured(
+            &first_rt,
+            HostRun::new(parent)
+                .with_children(vec![question, active])
+                .observe(Arc::new(first_watchdog)),
+            |handle, _| {
+                let _ = handle_tx.send(handle);
+            },
+        )
+        .await
+    });
+    let handle = handle_rx.await.expect("the coordinator handle");
+    fixture.root_question.notified().await;
+    fixture.child_question.notified().await;
+    fixture.active_child.notified().await;
+
+    let state = initial.state();
+    assert_eq!(state.running.len(), 3, "parent and both children are live");
+    assert_eq!(
+        state.questions.len(),
+        2,
+        "the parent and question child are parked"
+    );
+    assert!(handle.checkpoint_timeout(state).await);
+    first.abort();
+    let _ = first.await;
+
+    let resumed = RunWatchdog::with_limits(None, Some(Duration::from_millis(150)));
+    let delay = Arc::new(DelayActiveRedispatch {
+        watchdog: resumed.clone(),
+        delayed:  AtomicBool::new(false),
+        parked:   AtomicBool::new(false),
+    });
+    let rt = resume_timeout_runtime(&dir, fixture);
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(5),
+        host::resume_configured(
+            &rt,
+            Vec::new(),
+            vec![delay.clone(), Arc::new(resumed.clone())],
+            |handle, _| task = Some(resumed.start(handle)),
+        ),
+    )
+    .await
+    .expect("resume and timeout cleanup are bounded")
+    .expect("the run resumes");
+    task.expect("watchdog started").stop().await;
+
+    assert!(delay.delayed.load(Ordering::SeqCst));
+    assert!(
+        delay.parked.load(Ordering::SeqCst),
+        "the restored questions parked both clocks during sibling recovery"
+    );
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        resumed.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 150
+                && timeout.active_duration_ms >= 150
+    ));
 }
 
 /// A pause parks the watchdog: a run paused far longer than its stall
@@ -607,6 +1181,77 @@ async fn a_pending_question_parks_the_watchdog() {
         report.state.errors()
     );
     assert!(receipt.is_clean(), "{:?}", receipt.errors);
+}
+
+/// A question parks only its own branch. An independently running sibling
+/// keeps consuming the maximum active-runtime budget, and timeout
+/// cancellation joins both branches and the pending interview.
+#[tokio::test]
+async fn an_active_sibling_keeps_a_pending_question_bounded() {
+    const PARALLEL: &str = r#"digraph G {
+        graph [stall_timeout="0s", max_active_duration="400ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        fork [shape=component]
+        gate [shape=hexagon, label="Go?"]
+        long [shape=parallelogram, script="sleep 20"]
+        merge [shape=tripleoctagon]
+        start -> fork
+        fork -> gate
+        fork -> long
+        gate -> merge [label="[Y] Yes"]
+        long -> merge
+        merge -> exit
+    }"#;
+
+    struct WaitForCancellation;
+
+    #[async_trait::async_trait]
+    impl Interviewer for WaitForCancellation {
+        async fn reply(&self, _: InterviewRequest, cancel: CancellationToken) -> InterviewReply {
+            cancel.cancelled().await;
+            InterviewReply::Cancelled
+        }
+    }
+
+    let dir = RunDir::new("watchdog-question-with-active-sibling");
+    let rt = runtime(&dir);
+    let lowered = lower(&rt, &dir, PARALLEL);
+    let graph = lowered.graph.expect("lowers");
+    let watchdog =
+        RunWatchdog::with_limits(graph.policy.stall_timeout, graph.policy.max_active_duration);
+    let dispatcher = InterviewDispatcher::new(Arc::new(WaitForCancellation));
+    let host_run = HostRun::new(graph)
+        .with_children(lowered.children)
+        .observe(Arc::new(watchdog.clone()))
+        .observe(Arc::new(dispatcher.clone()));
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(&rt, host_run, |handle, secrets| {
+            dispatcher.wire(handle.clone(), secrets);
+            task = Some(watchdog.start(handle));
+        }),
+    )
+    .await
+    .expect("timeout cancellation and native cleanup are bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+    let receipt = dispatcher.shutdown().await;
+
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::MaximumActiveDuration(timeout))
+            if timeout.maximum_active_duration_ms == 400
+                && timeout.active_duration_ms >= 400
+    ));
+    assert!(receipt.is_clean(), "{receipt:?}");
+    let document = inspect_run_dir(dir.path()).await.expect("inspects");
+    assert!(
+        document.complete,
+        "all child work is terminal before the host returns: {document:?}"
+    );
 }
 
 // ── Controls ────────────────────────────────────────────────────────────────

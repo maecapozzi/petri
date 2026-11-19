@@ -7,7 +7,9 @@ use ir::{Control, FiringId};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{Coordinator, CoordinatorError};
-use crate::{CancelReason, CancelRequest, CoordinatorEvent, ExecutionId, InvocationId};
+use crate::{
+    CancelReason, CancelRequest, CoordinatorEvent, ExecutionId, InvocationId, RunTimeoutState,
+};
 
 pub(super) struct ControlRequest {
     execution: ExecutionId,
@@ -23,12 +25,18 @@ pub(super) struct PauseRequest {
     reply:  oneshot::Sender<()>,
 }
 
+pub(super) struct TimeoutRequest {
+    state: RunTimeoutState,
+    reply: oneshot::Sender<()>,
+}
+
 /// A cloneable control path for a coordinator that is currently running.
 #[derive(Clone)]
 pub struct CoordinatorHandle {
     cancel:  mpsc::UnboundedSender<CancelRequest>,
     control: mpsc::UnboundedSender<ControlRequest>,
     pause:   mpsc::UnboundedSender<PauseRequest>,
+    timeout: mpsc::Sender<TimeoutRequest>,
 }
 
 impl CoordinatorHandle {
@@ -102,6 +110,24 @@ impl CoordinatorHandle {
         }
         let _ = recorded.await;
     }
+
+    /// Record a durable checkpoint of native run-timeout accounting.
+    ///
+    /// The single-slot channel bounds pending checkpoint state. The watchdog
+    /// waits for each checkpoint before producing another one, and a timeout
+    /// cancellation is not requested until its final accounting is durable.
+    pub async fn checkpoint_timeout(&self, state: RunTimeoutState) -> bool {
+        let (reply, recorded) = oneshot::channel();
+        if self
+            .timeout
+            .send(TimeoutRequest { state, reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        recorded.await.is_ok()
+    }
 }
 
 impl Coordinator {
@@ -110,6 +136,7 @@ impl Coordinator {
             cancel:  self.cancel_tx.clone(),
             control: self.control_tx.clone(),
             pause:   self.pause_tx.clone(),
+            timeout: self.timeout_tx.clone(),
         }
     }
 
@@ -129,6 +156,19 @@ impl Coordinator {
                 CoordinatorEvent::RunUnpaused
             })
             .await?;
+        }
+        let _ = reply.send(());
+        Ok(())
+    }
+
+    pub(super) async fn handle_timeout(
+        &mut self,
+        request: TimeoutRequest,
+    ) -> Result<(), CoordinatorError> {
+        let TimeoutRequest { state, reply } = request;
+        if self.store.state().timeout.as_ref() != Some(&state) {
+            self.append(CoordinatorEvent::RunTimeoutUpdated { state })
+                .await?;
         }
         let _ = reply.send(());
         Ok(())

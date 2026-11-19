@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use driver::{ExecutionSlot, HookContext, ParentLink};
-use engine::{EngineExit, EngineStart, EntryPoint, Event, MiddlewareKey};
+use engine::{EngineExit, EngineStart, EngineState, EntryPoint, Event, MiddlewareKey};
 use ir::{Graph, RunStatus, Value};
 use runtime::{RunAccess, RunRuntime};
 use smol_str::SmolStr;
@@ -24,7 +24,7 @@ use tokio::task::{JoinError, JoinSet};
 
 use self::gate::{AdmittedSlot, ForkGate, GateKey};
 pub use self::handle::CoordinatorHandle;
-use self::handle::{ControlRequest, PauseRequest};
+use self::handle::{ControlRequest, PauseRequest, TimeoutRequest};
 use self::leases::{ExecutionLeases, InvocationReleased, validate_resources};
 use self::live::LiveInvocations;
 use self::result::{project_result, rebuild_middleware};
@@ -158,6 +158,7 @@ struct PreparedExecution {
     driver:            driver::Driver,
     pipeline:          Arc<MiddlewarePipeline>,
     cancel_before_run: bool,
+    resumed_state:     Option<EngineState>,
     /// The fork slot a gated child holds while it is live, released once
     /// its `ExecutionFinished` is recorded.
     slot:              Option<ExecutionSlot>,
@@ -193,6 +194,8 @@ pub struct Coordinator {
     control_rx:       mpsc::UnboundedReceiver<ControlRequest>,
     pause_tx:         mpsc::UnboundedSender<PauseRequest>,
     pause_rx:         mpsc::UnboundedReceiver<PauseRequest>,
+    timeout_tx:       mpsc::Sender<TimeoutRequest>,
+    timeout_rx:       mpsc::Receiver<TimeoutRequest>,
     admit_tx:         mpsc::UnboundedSender<AdmittedSlot>,
     admit_rx:         mpsc::UnboundedReceiver<AdmittedSlot>,
     /// The status of every invocation a start request attached to; it
@@ -355,6 +358,7 @@ impl Coordinator {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (pause_tx, pause_rx) = mpsc::unbounded_channel();
+        let (timeout_tx, timeout_rx) = mpsc::channel(1);
         let (admit_tx, admit_rx) = mpsc::unbounded_channel();
         // The records are the executor's ledger from here on: every
         // container scope it allocates is written here before it exists.
@@ -375,6 +379,8 @@ impl Coordinator {
             control_rx,
             pause_tx,
             pause_rx,
+            timeout_tx,
+            timeout_rx,
             admit_tx,
             admit_rx,
             statuses: BTreeMap::new(),
@@ -670,6 +676,11 @@ impl Coordinator {
                         self.handle_pause(request).await?;
                     }
                 }
+                request = self.timeout_rx.recv() => {
+                    if let Some(request) = request {
+                        self.handle_timeout(request).await?;
+                    }
+                }
                 request = self.control_rx.recv() => {
                     if let Some(request) = request {
                         self.handle_control(request);
@@ -838,6 +849,7 @@ impl Coordinator {
             driver,
             pipeline,
             cancel_before_run,
+            resumed_state,
             slot,
             leases,
         } = self
@@ -852,6 +864,11 @@ impl Coordinator {
             .await?;
         let handle = driver.handle();
         self.live.run(invocation, execution, handle.clone(), leases);
+        if let Some(resumed_state) = resumed_state {
+            for observer in &self.observers {
+                observer.on_execution_resumed(execution, &resumed_state);
+            }
+        }
         running.spawn(async move {
             if cancel_before_run {
                 handle.cancel(ir::CancelScopeId::ROOT).await;
@@ -1061,7 +1078,7 @@ impl Coordinator {
         );
         let decoded = read_execution_log(&**self.store.logs(), execution).await?;
         let context = self.hook_context(invocation, execution);
-        let (driver, writer, leases) = if decoded.log.is_empty() {
+        let (driver, writer, leases, resumed_state) = if decoded.log.is_empty() {
             let writer = Arc::new(ExecutionLogWriter::new(self.writer.clone(), execution, 0));
             let (sandbox, leases) = self
                 .prepare_sandbox(invocation, execution, writer.clone())
@@ -1074,7 +1091,7 @@ impl Coordinator {
                 sandbox,
                 secrets,
             );
-            (driver, writer, leases)
+            (driver, writer, leases, None)
         } else {
             // Replaying an existing root cancellation already restores it.
             // Sending it again would ask the driver to escalate to a kill.
@@ -1096,6 +1113,7 @@ impl Coordinator {
                     }
                 })?;
             }
+            let resumed_state = engine::replay((*graph).clone(), &decoded.log);
             let high_water = decoded.log.len() as u64;
             let writer = Arc::new(ExecutionLogWriter::new(
                 self.writer.clone(),
@@ -1113,7 +1131,12 @@ impl Coordinator {
                 sandbox,
                 secrets,
             )?;
-            (driver.with_engine_start(start.clone()), writer, leases)
+            (
+                driver.with_engine_start(start.clone()),
+                writer,
+                leases,
+                Some(resumed_state),
+            )
         };
         let client = CoordinatorInvocationClient::new(execution, self.start_tx.clone());
         let identity = crate::ExecutionIdentity {
@@ -1147,6 +1170,7 @@ impl Coordinator {
             driver,
             pipeline,
             cancel_before_run,
+            resumed_state,
             slot: execution_slot,
             leases,
         })

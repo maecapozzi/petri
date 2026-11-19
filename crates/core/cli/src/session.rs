@@ -11,12 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Args;
 use execution::controls::ControlService;
 use execution::host::{HostError, HostRun};
-use execution::watchdog::StallWatchdog;
+use execution::watchdog::{RunTimeout, RunWatchdog};
 use execution::{
     Access, CoordinatorHandle, InterviewDispatcher, InterviewReceipt, Interviewer, LeaseState,
     RECEIPT_FILE, RECEIPT_VERSION, ResourceStore, host, open_run_dir,
@@ -24,7 +23,7 @@ use execution::{
 use runtime::driver::ExecutionReport;
 use runtime::executor::Retention;
 use runtime::frontend::{LaunchSettings, WorkspaceRetention};
-use runtime::ir::{Graph, RunStatus};
+use runtime::ir::{Graph, RunPolicy, RunStatus};
 use runtime::{DaytonaResources, RunOptions, Runtime, SandboxBackend};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -133,9 +132,9 @@ pub(crate) enum Start {
         graph:    Graph,
         children: Vec<Graph>,
     },
-    /// The run in the run dir, continued from its durable record. The stall
-    /// budget is read from the stored root graph by the caller.
-    Resume { stall_timeout: Option<Duration> },
+    /// The run in the run dir, continued from its durable record. Timeout
+    /// budgets are read from the stored root graph by the caller.
+    Resume { policy: RunPolicy },
 }
 
 /// What one session is made of, beyond how it starts.
@@ -186,12 +185,13 @@ pub(crate) async fn drive(
     let stop_controls = CancellationToken::new();
     let mut observers: Vec<Arc<dyn execution::ExecutionObserver>> =
         vec![Arc::new(controls.clone())];
-    // The stall watchdog, when the graph declares a budget.
-    let stall_timeout = match &start {
-        Start::Fresh { graph, .. } => graph.policy.stall_timeout,
-        Start::Resume { stall_timeout } => *stall_timeout,
+    // The native watchdog, when the graph declares either budget.
+    let policy = match &start {
+        Start::Fresh { graph, .. } => graph.policy,
+        Start::Resume { policy } => *policy,
     };
-    let watchdog = stall_timeout.map(StallWatchdog::new);
+    let watchdog = (policy.stall_timeout.is_some() || policy.max_active_duration.is_some())
+        .then(|| RunWatchdog::with_limits(policy.stall_timeout, policy.max_active_duration));
     let mut watchdog_task = None;
     if let Some(watchdog) = &watchdog {
         observers.push(Arc::new(watchdog.clone()));
@@ -255,13 +255,21 @@ pub(crate) async fn drive(
     if let Some(task) = watchdog_task {
         task.stop().await;
     }
-    if let Some(stall) = watchdog.as_ref().and_then(StallWatchdog::tripped) {
-        eprintln!(
-            "stall watchdog: no execution activity for {} s (stall_timeout {} s); the run was \
-             cancelled",
-            stall.idle_ms / 1000,
-            stall.stall_timeout_ms / 1000
-        );
+    if let Some(timeout) = watchdog.as_ref().and_then(RunWatchdog::timeout_reason) {
+        match timeout {
+            RunTimeout::Stall(stall) => eprintln!(
+                "stall watchdog: no execution activity for {} s (stall_timeout {} s); the run was \
+                 cancelled",
+                stall.idle_ms / 1000,
+                stall.stall_timeout_ms / 1000
+            ),
+            RunTimeout::MaximumActiveDuration(maximum) => eprintln!(
+                "run watchdog: active execution reached {} s (max_active_duration {} s); the run \
+                 was cancelled",
+                maximum.active_duration_ms / 1000,
+                maximum.maximum_active_duration_ms / 1000
+            ),
+        }
     }
     // The receipt is written whatever the run did: a failed run's interviews
     // are evidence too.

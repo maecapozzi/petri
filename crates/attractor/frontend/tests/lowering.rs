@@ -1484,9 +1484,8 @@ fn native_agent_timeout_policy_follows_backend_resolution() {
     }
 }
 
-/// `stall_timeout` and `loop_restart_signature_limit` lower to the graph's
-/// run policy with Fabro's defaults; zero disables the watchdog and a limit
-/// below one is refused.
+/// Run timeout and circuit-breaker attributes lower with Fabro's defaults;
+/// zero disables either clock and a signature limit below one is refused.
 #[test]
 fn run_policies_lower_with_fabro_defaults() {
     let graph = lower_ok(&dot(r#"
@@ -1495,7 +1494,11 @@ fn run_policies_lower_with_fabro_defaults() {
     "#));
     assert_eq!(
         graph.policy.stall_timeout,
-        Some(Duration::from_secs(30 * 60))
+        Some(Duration::from_secs(10 * 60))
+    );
+    assert_eq!(
+        graph.policy.max_active_duration,
+        Some(Duration::from_secs(90 * 60))
     );
     assert_eq!(
         graph
@@ -1505,11 +1508,12 @@ fn run_policies_lower_with_fabro_defaults() {
         Some(3)
     );
     let graph = lower_ok(&dot(r#"
-        graph [stall_timeout="0s", loop_restart_signature_limit=5]
+        graph [stall_timeout="0s", max_active_duration="0s", loop_restart_signature_limit=5]
         a [prompt="x"]
         start -> a -> exit
     "#));
     assert_eq!(graph.policy.stall_timeout, None);
+    assert_eq!(graph.policy.max_active_duration, None);
     assert_eq!(
         graph
             .policy
@@ -1518,11 +1522,15 @@ fn run_policies_lower_with_fabro_defaults() {
         Some(5)
     );
     let graph = lower_ok(&dot(r#"
-        graph [stall_timeout="90s"]
+        graph [stall_timeout="90s", max_active_duration="2h"]
         a [prompt="x"]
         start -> a -> exit
     "#));
     assert_eq!(graph.policy.stall_timeout, Some(Duration::from_secs(90)));
+    assert_eq!(
+        graph.policy.max_active_duration,
+        Some(Duration::from_secs(2 * 60 * 60))
+    );
     let codes = codes(&dot(r#"
         graph [loop_restart_signature_limit=0]
         a [prompt="x"]
@@ -1533,7 +1541,7 @@ fn run_policies_lower_with_fabro_defaults() {
         "{codes:?}"
     );
     let diags = diagnostics(&dot(r#"
-        graph [stall_timeout="5m", loop_restart_signature_limit=2]
+        graph [stall_timeout="5m", max_active_duration="1h", loop_restart_signature_limit=2]
         a [prompt="x"]
         start -> a -> exit
     "#));
@@ -1541,6 +1549,7 @@ fn run_policies_lower_with_fabro_defaults() {
         !diags
             .iter()
             .any(|d| d.code.starts_with("ignored.stall_timeout")
+                || d.code.starts_with("ignored.max_active_duration")
                 || d.code.starts_with("ignored.loop_restart")),
         "{diags:?}"
     );

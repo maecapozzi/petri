@@ -136,7 +136,7 @@ pub(crate) async fn resume(
         control_file: args.control.map(|path| (path, TailFrom::End)),
     };
     let start = Start::Resume {
-        stall_timeout: graph.policy.stall_timeout,
+        policy: graph.policy,
     };
     Box::pin(session::drive(
         &rt.options(options),

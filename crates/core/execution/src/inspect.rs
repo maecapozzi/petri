@@ -198,8 +198,9 @@ pub struct InvocationInspection {
     /// `isolated` or `inherited`.
     pub sandbox:          &'static str,
     pub cancel_requested: bool,
-    /// Why, when the requester said: `interrupt`, `control`, or
-    /// `stall_timeout` with its budget and idle time.
+    /// Why, when the requester said: `interrupt`, `control`,
+    /// `stall_timeout` with its budget and idle time, or
+    /// `maximum_active_duration` with its budget and consumed active time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_reason:    Option<CancelReason>,
     /// Every execution of this invocation in order; each after the first

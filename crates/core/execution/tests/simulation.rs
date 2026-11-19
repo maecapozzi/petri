@@ -523,6 +523,7 @@ fn kind_of(record: &CoordinatorRecord) -> &'static str {
         CoordinatorEvent::RunNoteRecorded { .. } => "run.note.recorded",
         CoordinatorEvent::RunPaused => "run.paused",
         CoordinatorEvent::RunUnpaused => "run.unpaused",
+        CoordinatorEvent::RunTimeoutUpdated { .. } => "run.timeout.updated",
     }
 }
 
@@ -534,13 +535,15 @@ fn kind_of(record: &CoordinatorRecord) -> &'static str {
 type Seen = Arc<Mutex<Vec<(u32, u64, &'static str)>>>;
 
 struct Watch {
-    lifetime: u32,
-    seen:     Seen,
-    trigger:  Option<(&'static str, usize)>,
-    count:    Mutex<usize>,
-    crash:    Arc<Notify>,
-    gates:    Mutex<Gates>,
-    shared:   Arc<Mutex<Shared>>,
+    lifetime:       u32,
+    seen:           Seen,
+    trigger:        Option<(&'static str, usize)>,
+    count:          Mutex<usize>,
+    crash:          Arc<Notify>,
+    gates:          Mutex<Gates>,
+    shared:         Arc<Mutex<Shared>>,
+    timeout_inputs: Arc<Mutex<Vec<(u64, TimeoutInput)>>>,
+    epoch:          Instant,
 }
 
 /// What the observers of every lifetime add up.
@@ -549,6 +552,254 @@ struct Shared {
     violations: Vec<String>,
     /// How often a gate ran as many children as it has slots.
     full_gates: u64,
+}
+
+/// The independently reconstructed timeout inputs. This deliberately models
+/// the documented structural contract instead of the watchdog implementation:
+/// coordinator records are not activity, while known step progress is.
+#[derive(Clone, Debug)]
+enum TimeoutInput {
+    Resume {
+        execution: ExecutionId,
+        running:   BTreeSet<ir::FiringId>,
+        questions: BTreeSet<(ir::FiringId, String)>,
+    },
+    Dispatch {
+        execution: ExecutionId,
+        firing:    ir::FiringId,
+    },
+    Progress {
+        meaningful: bool,
+    },
+    Question {
+        execution: ExecutionId,
+        firing:    ir::FiringId,
+        question:  String,
+    },
+    QuestionExpired {
+        execution: ExecutionId,
+        question:  String,
+    },
+    Answer {
+        execution: ExecutionId,
+        question:  String,
+    },
+    Finished {
+        execution: ExecutionId,
+        firing:    ir::FiringId,
+    },
+    Paused,
+    Unpaused,
+    Bookkeeping,
+}
+
+/// A clock snapshot reconstructed from the durable event stream.
+#[derive(Default)]
+struct TimeoutOracle {
+    running:   BTreeSet<(ExecutionId, ir::FiringId)>,
+    questions: BTreeSet<(ExecutionId, ir::FiringId, String)>,
+    paused:    bool,
+    started:   bool,
+    idle_ms:   u64,
+    active_ms: u64,
+    last_at:   Option<u64>,
+}
+
+impl TimeoutOracle {
+    fn questions_cover_running(&self) -> bool {
+        !self.running.is_empty()
+            && self.running.iter().all(|(execution, firing)| {
+                self.questions.iter().any(|(asked_by, asked_firing, _)| {
+                    asked_by == execution && asked_firing == firing
+                })
+            })
+    }
+
+    fn idle_clock_runs(&self) -> bool {
+        self.started && !self.paused && !self.questions_cover_running()
+    }
+
+    fn active_clock_runs(&self) -> bool {
+        self.idle_clock_runs() && !self.running.is_empty()
+    }
+
+    fn settle(&mut self, at: u64) {
+        let Some(last_at) = self.last_at.replace(at) else {
+            return;
+        };
+        let elapsed = at.saturating_sub(last_at);
+        if self.idle_clock_runs() {
+            self.idle_ms = self.idle_ms.saturating_add(elapsed);
+        }
+        if self.active_clock_runs() {
+            self.active_ms = self.active_ms.saturating_add(elapsed);
+        }
+    }
+
+    fn apply(&mut self, at: u64, input: &TimeoutInput) {
+        if let TimeoutInput::Resume {
+            execution,
+            running,
+            questions,
+        } = input
+        {
+            // Recovery and downtime do not consume either clock. This callback
+            // is immediately before redispatch, so it is the recovery
+            // linearization point for this oracle.
+            self.last_at = Some(at);
+            self.running
+                .retain(|(running_execution, _)| running_execution != execution);
+            self.questions
+                .retain(|(asked_by, _, _)| asked_by != execution);
+            self.running
+                .extend(running.iter().map(|firing| (*execution, *firing)));
+            self.questions.extend(
+                questions
+                    .iter()
+                    .map(|(firing, question)| (*execution, *firing, question.clone())),
+            );
+            self.started |= !running.is_empty();
+            return;
+        }
+
+        self.settle(at);
+        match input {
+            TimeoutInput::Resume { .. } => unreachable!("resume is handled above"),
+            TimeoutInput::Dispatch { execution, firing } => {
+                self.started = true;
+                self.running.insert((*execution, *firing));
+            }
+            TimeoutInput::Progress { meaningful: true } => self.idle_ms = 0,
+            TimeoutInput::Progress { meaningful: false } => {}
+            TimeoutInput::Question {
+                execution,
+                firing,
+                question,
+            } => {
+                self.questions
+                    .insert((*execution, *firing, question.clone()));
+            }
+            TimeoutInput::QuestionExpired {
+                execution,
+                question,
+            }
+            | TimeoutInput::Answer {
+                execution,
+                question,
+            } => {
+                let removed = self
+                    .questions
+                    .iter()
+                    .any(|(asked_by, _, pending)| asked_by == execution && pending == question);
+                self.questions
+                    .retain(|(asked_by, _, pending)| asked_by != execution || pending != question);
+                if removed {
+                    self.idle_ms = 0;
+                }
+            }
+            TimeoutInput::Finished { execution, firing } => {
+                self.running.remove(&(*execution, *firing));
+                self.questions.retain(|(asked_by, asked_firing, _)| {
+                    asked_by != execution || asked_firing != firing
+                });
+            }
+            TimeoutInput::Paused => self.paused = true,
+            TimeoutInput::Unpaused => self.paused = false,
+            TimeoutInput::Bookkeeping => {}
+        }
+    }
+}
+
+fn timeout_state_at(inputs: &[(u64, TimeoutInput)], at: u64) -> TimeoutOracle {
+    let mut oracle = TimeoutOracle::default();
+    for (event_at, input) in inputs {
+        if *event_at >= at {
+            break;
+        }
+        oracle.apply(*event_at, input);
+    }
+    oracle.settle(at);
+    oracle
+}
+
+/// Progress classification for the simulation oracle. Keep it structural:
+/// arbitrary custom payloads, heartbeat and retry records cannot prolong idle
+/// time just because they were written.
+fn oracle_meaningful_progress(event: &ir::StepEvent) -> bool {
+    match event {
+        ir::StepEvent::Log { line, .. } => !line.is_empty(),
+        ir::StepEvent::Artifact { .. } => true,
+        ir::StepEvent::Custom(value) => {
+            let Some(model) = value
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|kind| *kind == "pebble")
+                .and_then(|_| value.get("event"))
+                .and_then(|envelope| envelope.get("event"))
+                .and_then(Value::as_object)
+            else {
+                return false;
+            };
+            model.contains_key("LlmRequestStarted")
+                || model.contains_key("LlmFirstOutput")
+                || model.contains_key("ToolCallStarted")
+                || model.contains_key("ToolCallCompleted")
+                || model.contains_key("AssistantMessage")
+                || ["TextDelta", "ReasoningDelta"].into_iter().any(|kind| {
+                    model
+                        .get(kind)
+                        .and_then(|payload| payload.get("delta"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|delta| !delta.is_empty())
+                })
+                || model
+                    .get("AssistantOutputReplace")
+                    .is_some_and(|replacement| {
+                        ["text", "reasoning"].into_iter().any(|field| {
+                            replacement
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| !value.is_empty())
+                        })
+                    })
+        }
+    }
+}
+
+fn timeout_inputs_from_engine(
+    engine: &EngineState,
+) -> (BTreeSet<ir::FiringId>, BTreeSet<(ir::FiringId, String)>) {
+    let running: BTreeSet<_> = engine
+        .live_firings()
+        .filter(|firing| firing.started)
+        .map(|firing| firing.id)
+        .collect();
+    let mut questions = BTreeSet::new();
+    for record in engine.log.records() {
+        match &record.event {
+            Event::StepProgressRecorded { firing, ev } => {
+                if let Some(question) = Question::from_event(ev) {
+                    questions.insert((*firing, question.id));
+                } else if let Some(expired) = QuestionExpired::from_event(ev) {
+                    questions.retain(|(_, pending)| pending != &expired.question);
+                }
+            }
+            Event::ControlRequested {
+                ctl: ir::Control::Deliver(value),
+                ..
+            } => {
+                if let Some(answer) = Answer::from_value(value).and_then(|answer| answer.question) {
+                    questions.retain(|(_, pending)| pending != &answer);
+                }
+            }
+            Event::StepFinished { firing, .. } => {
+                questions.retain(|(asked_by, _)| asked_by != firing);
+            }
+            _ => {}
+        }
+    }
+    questions.retain(|(firing, _)| running.contains(firing));
+    (running, questions)
 }
 
 /// Which gate each invocation waits on, and which executions of each gate's
@@ -623,6 +874,20 @@ impl ExecutionObserver for Watch {
                 .of_execution
                 .insert(*execution, declared.declaration.invocation);
         }
+    }
+
+    fn on_execution_resumed(&self, execution: ExecutionId, state: &EngineState) {
+        let (running, questions) = timeout_inputs_from_engine(state);
+        let at = SIMULATED_EPOCH_MS
+            + u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.timeout_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((at, TimeoutInput::Resume {
+                execution,
+                running,
+                questions,
+            }));
     }
 
     fn on_lifecycle(&self, record: &CoordinatorRecord) {
@@ -935,7 +1200,7 @@ fn simulate_world(seed: u64) -> Outcome {
         let mut zombie: Option<Zombie<'_>> = None;
         let mut lifetime = 0_u32;
         let mut stored_at_start = BTreeMap::new();
-        let mut started_at = BTreeMap::new();
+        let timeout_inputs = Arc::new(Mutex::new(Vec::new()));
         // The interview receipt as the CLI keeps it on disk: written at each
         // outcome, continued by the next lifetime.
         let receipt: Arc<Mutex<Option<InterviewReceipt>>> = Arc::new(Mutex::new(None));
@@ -955,6 +1220,8 @@ fn simulate_world(seed: u64) -> Outcome {
                 crash: Arc::clone(&notify),
                 gates: Mutex::new(Gates::default()),
                 shared: Arc::clone(&shared),
+                timeout_inputs: Arc::clone(&timeout_inputs),
+                epoch,
             });
             if let Some(Crash::Call(at)) = crash {
                 sim.world.crash_at(at, Arc::clone(&notify));
@@ -1021,10 +1288,6 @@ fn simulate_world(seed: u64) -> Outcome {
                     }
                 }
             };
-            started_at.insert(
-                lifetime,
-                SIMULATED_EPOCH_MS + u64::try_from(epoch.elapsed().as_millis()).unwrap_or(0),
-            );
             let stored = if lifetime == 0 {
                 0
             } else {
@@ -1217,7 +1480,7 @@ fn simulate_world(seed: u64) -> Outcome {
             &workload,
             &seen,
             &stored_at_start,
-            &started_at,
+            &timeout_inputs,
             receipt.as_ref(),
             &mut stats,
             &mut violations,
@@ -1283,7 +1546,7 @@ async fn check(
     workload: &Workload,
     seen: &Mutex<Vec<(u32, u64, &'static str)>>,
     stored_at_start: &BTreeMap<u32, u64>,
-    started_at: &BTreeMap<u32, u64>,
+    resumed_timeout_inputs: &Mutex<Vec<(u64, TimeoutInput)>>,
     receipt: Option<&InterviewReceipt>,
     stats: &mut BTreeMap<&'static str, u64>,
     violations: &mut Vec<String>,
@@ -1679,14 +1942,26 @@ async fn check(
     windows.extend(open.map(|from| (from, u64::MAX)));
     *stats.entry("pauses").or_default() += windows.len() as u64;
     let paused_at = |at: u64| windows.iter().any(|(from, to)| at > *from && at < *to);
-    let mut activity: Vec<u64> = records.iter().map(|record| record.recorded_at).collect();
-    activity.extend(started_at.values().copied());
+    let mut timeout_inputs = resumed_timeout_inputs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    timeout_inputs.extend(records.iter().map(|record| {
+        let input = match record.body {
+            CoordinatorEvent::RunPaused => TimeoutInput::Paused,
+            CoordinatorEvent::RunUnpaused => TimeoutInput::Unpaused,
+            // All other coordinator events are structural bookkeeping to this
+            // oracle, including timeout checkpoints and cancellation records.
+            _ => TimeoutInput::Bookkeeping,
+        };
+        (record.recorded_at, input)
+    }));
     // Questions: each answer names a question its firing asked, reaches the
     // log no later than the firing's end (the same instant is a race the
     // driver refuses; a later one is an answer the dispatcher sent while the
     // firing lived, which a slow store held up, and the receipt says it was
     // not live), no question is answered more often than it was asked, and
-    // the times a question waited on the host park the watchdog.
+    // and no question is answered more often than it was asked.
     let not_live: BTreeSet<(ExecutionId, String)> = receipt
         .map(|receipt| {
             receipt
@@ -1697,7 +1972,6 @@ async fn check(
                 .collect()
         })
         .unwrap_or_default();
-    let mut waiting: Vec<(u64, u64)> = Vec::new();
     for execution in state.executions.keys() {
         let Ok(decoded) = read_execution_log(&*logs, *execution).await else {
             continue;
@@ -1741,9 +2015,7 @@ async fn check(
                         *stats.entry("questions").or_default() += 1;
                     } else if let Some(expired) = QuestionExpired::from_event(ev) {
                         *stats.entry("expired questions").or_default() += 1;
-                        if let Some(from) = open.remove(&(firing.raw(), expired.question)) {
-                            waiting.push((from, *at));
-                        }
+                        open.remove(&(firing.raw(), expired.question));
                     }
                 }
                 Event::ControlRequested {
@@ -1768,9 +2040,7 @@ async fn check(
                             ));
                         }
                         *answers.entry(key.clone()).or_default() += 1;
-                        if let Some(from) = open.remove(&key) {
-                            waiting.push((from, *at));
-                        }
+                        open.remove(&key);
                     }
                 }
                 Event::StepFinished { firing, .. } => {
@@ -1781,9 +2051,7 @@ async fn check(
                         .cloned()
                         .collect();
                     for key in asked {
-                        if let Some(from) = open.remove(&key) {
-                            waiting.push((from, *at));
-                        }
+                        open.remove(&key);
                     }
                 }
                 _ => {}
@@ -1797,9 +2065,52 @@ async fn check(
                 ));
             }
         }
-        waiting.extend(open.values().map(|from| (*from, u64::MAX)));
         for (record, at) in decoded.log.records().iter().zip(&decoded.recorded_at) {
-            activity.push(*at);
+            match &record.event {
+                Event::StepStarted { firing, .. } => {
+                    timeout_inputs.push((*at, TimeoutInput::Dispatch {
+                        execution: *execution,
+                        firing:    *firing,
+                    }))
+                }
+                Event::StepProgressRecorded { firing, ev } => {
+                    timeout_inputs.push((*at, TimeoutInput::Progress {
+                        meaningful: oracle_meaningful_progress(ev),
+                    }));
+                    if let Some(question) = Question::from_event(ev) {
+                        timeout_inputs.push((*at, TimeoutInput::Question {
+                            execution: *execution,
+                            firing:    *firing,
+                            question:  question.id,
+                        }));
+                    } else if let Some(expired) = QuestionExpired::from_event(ev) {
+                        timeout_inputs.push((*at, TimeoutInput::QuestionExpired {
+                            execution: *execution,
+                            question:  expired.question,
+                        }));
+                    }
+                }
+                Event::ControlRequested {
+                    ctl: ir::Control::Deliver(value),
+                    ..
+                } => {
+                    if let Some(answer) =
+                        Answer::from_value(value).and_then(|answer| answer.question)
+                    {
+                        timeout_inputs.push((*at, TimeoutInput::Answer {
+                            execution: *execution,
+                            question:  answer,
+                        }));
+                    }
+                }
+                Event::StepFinished { firing, .. } => {
+                    timeout_inputs.push((*at, TimeoutInput::Finished {
+                        execution: *execution,
+                        firing:    *firing,
+                    }))
+                }
+                _ => {}
+            }
             if let Event::AdmissionDecided {
                 decision_id: DecisionId::AttemptStart { firing, attempt },
                 decision: Admission::Admit,
@@ -1814,22 +2125,14 @@ async fn check(
             }
         }
     }
-    // A question waits on the host only while its lifetime lives: a resumed
-    // run that does not ask it again has nothing waiting.
-    for window in &mut waiting {
-        if let Some(next) = started_at
-            .values()
-            .copied()
-            .filter(|start| *start > window.0)
-            .min()
-        {
-            window.1 = window.1.min(next);
-        }
-    }
-    // The watchdog: a stall cancel only after a whole budget with no
-    // record, no lifetime start and no unpause, and never while paused.
+    // The watchdog: reconstruct the independent structural clocks from
+    // dispatch, durable step progress, questions, pauses and redispatch
+    // readiness. The timeout decision snapshots these clocks before writing
+    // its checkpoint and cancellation records, so same-millisecond records
+    // are not evidence that the decision was premature.
     if let Some(budget) = workload.stall {
         let budget = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+        timeout_inputs.sort_by_key(|(at, _)| *at);
         for record in &records {
             let CoordinatorEvent::InvocationCancelRequested {
                 reason: Some(execution::CancelReason::StallTimeout { .. }),
@@ -1839,25 +2142,21 @@ async fn check(
                 continue;
             };
             let at = record.recorded_at;
-            let last = activity
-                .iter()
-                .copied()
-                .filter(|t| *t < at)
-                .max()
-                .unwrap_or(0);
-            if at - last < budget {
+            let oracle = timeout_state_at(&timeout_inputs, at);
+            if oracle.idle_ms < budget {
                 violations.push(format!(
-                    "the watchdog cancelled at {at}, {} ms after the last activity (budget \
-                     {budget})",
-                    at - last
+                    "the watchdog cancelled at {at}, after only {} ms of structural idle time \
+                     (budget {budget}; active {} ms)",
+                    oracle.idle_ms, oracle.active_ms
                 ));
             }
-            if paused_at(at) {
+            if oracle.paused {
                 violations.push(format!("the watchdog cancelled at {at}, while paused"));
             }
-            if waiting.iter().any(|(from, to)| at > *from && at < *to) {
+            if oracle.questions_cover_running() {
                 violations.push(format!(
-                    "the watchdog cancelled at {at}, while a question waited on the host"
+                    "the watchdog cancelled at {at}, while every active firing waited on a \
+                     person"
                 ));
             }
         }
@@ -2161,6 +2460,30 @@ fn simulate_or_panic(seed: u64) -> Outcome {
             ..Outcome::default()
         }
     })
+}
+
+#[test]
+fn timeout_oracle_ignores_bookkeeping_but_honors_meaningful_progress() {
+    let execution = ExecutionId::new(1);
+    let firing = ir::FiringId::new(1);
+    let bookkeeping = vec![
+        (0, TimeoutInput::Dispatch { execution, firing }),
+        (10, TimeoutInput::Progress { meaningful: true }),
+        // This stands for a timeout checkpoint (or any other coordinator
+        // bookkeeping record), not execution activity.
+        (80, TimeoutInput::Bookkeeping),
+    ];
+    let after_checkpoint = timeout_state_at(&bookkeeping, 100);
+    assert_eq!(after_checkpoint.idle_ms, 90);
+
+    let progress = vec![
+        (0, TimeoutInput::Dispatch { execution, firing }),
+        (80, TimeoutInput::Progress { meaningful: true }),
+        (90, TimeoutInput::Bookkeeping),
+    ];
+    let after_progress = timeout_state_at(&progress, 100);
+    assert_eq!(after_progress.idle_ms, 20);
+    assert_eq!(after_progress.active_ms, 100);
 }
 
 /// Every seed keeps every rule, through crashes, cancels, kills, restarts,

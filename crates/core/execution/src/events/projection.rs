@@ -178,6 +178,7 @@ impl Projection {
             CoordinatorEvent::GraphRegistered { .. }
             | CoordinatorEvent::RunPaused
             | CoordinatorEvent::RunUnpaused
+            | CoordinatorEvent::RunTimeoutUpdated { .. }
             | CoordinatorEvent::RunFinished { .. } => (None, None, None),
             CoordinatorEvent::InvocationDeclared {
                 invocation, call, ..
@@ -210,15 +211,26 @@ impl Projection {
             // `scope.acquired` record's.
             CoordinatorEvent::ScopeReleased { invocation, .. } => (Some(*invocation), None, None),
             CoordinatorEvent::InvocationCancelRequested { invocation, reason } => {
-                if let Some(CancelReason::StallTimeout {
-                    stall_timeout_ms,
-                    idle_ms,
-                }) = reason
-                {
-                    views.push(None, ViewEvent::RunStalled {
-                        stall_timeout_ms: *stall_timeout_ms,
-                        idle_ms:          *idle_ms,
-                    });
+                match reason {
+                    Some(CancelReason::StallTimeout {
+                        stall_timeout_ms,
+                        idle_ms,
+                    }) => {
+                        views.push(None, ViewEvent::RunStalled {
+                            stall_timeout_ms: *stall_timeout_ms,
+                            idle_ms:          *idle_ms,
+                        });
+                    }
+                    Some(CancelReason::MaximumActiveDuration {
+                        maximum_active_duration_ms,
+                        active_duration_ms,
+                    }) => {
+                        views.push(None, ViewEvent::RunMaximumActiveDurationExceeded {
+                            maximum_active_duration_ms: *maximum_active_duration_ms,
+                            active_duration_ms:         *active_duration_ms,
+                        });
+                    }
+                    Some(CancelReason::Interrupt | CancelReason::Control) | None => {}
                 }
                 (Some(*invocation), None, None)
             }

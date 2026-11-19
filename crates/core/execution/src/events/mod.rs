@@ -609,6 +609,13 @@ pub enum ViewEvent {
         stall_timeout_ms: u64,
         idle_ms:          u64,
     },
+    /// The run consumed its maximum active execution duration. Attached to
+    /// the `invocation.cancel.requested` record that carries the reason.
+    #[serde(rename = "run.maximum_active_duration_exceeded")]
+    RunMaximumActiveDurationExceeded {
+        maximum_active_duration_ms: u64,
+        active_duration_ms:         u64,
+    },
 }
 
 /// Metrics helpers a projection consumer commonly wants.

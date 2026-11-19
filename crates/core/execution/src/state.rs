@@ -8,7 +8,8 @@ use smol_str::SmolStr;
 use crate::host::ForkOrigin;
 use crate::{
     AttemptAdmission, CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId, GraphDigest,
-    InvocationId, InvocationResult, ParentCallKey, SandboxBinding, SandboxLeaseId, SecretBindings,
+    InvocationId, InvocationResult, ParentCallKey, RunTimeoutState, SandboxBinding, SandboxLeaseId,
+    SecretBindings,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,6 +117,10 @@ pub struct CoordinatorState {
     /// with admission held when it is.
     #[serde(default)]
     pub paused:                bool,
+    /// The newest durable timeout accounting checkpoint. `None` is the
+    /// compatibility state for runs created before accounting existed.
+    #[serde(default)]
+    pub timeout:               Option<RunTimeoutState>,
     /// Every run-level note, in record order: the reports of hook points
     /// that belong to no firing.
     #[serde(default)]
@@ -339,6 +344,7 @@ impl CoordinatorState {
             // what the run holds.
             CoordinatorEvent::RunPaused
             | CoordinatorEvent::RunUnpaused
+            | CoordinatorEvent::RunTimeoutUpdated { .. }
             | CoordinatorEvent::RunNoteRecorded { .. }
             | CoordinatorEvent::ScopeReleased { .. } => {}
             CoordinatorEvent::RunFinished {
@@ -467,6 +473,9 @@ impl CoordinatorState {
             }
             CoordinatorEvent::RunPaused => self.paused = true,
             CoordinatorEvent::RunUnpaused => self.paused = false,
+            CoordinatorEvent::RunTimeoutUpdated { state } => {
+                self.timeout = Some(state.clone());
+            }
             CoordinatorEvent::RunNoteRecorded {
                 execution,
                 kind,
