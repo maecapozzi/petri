@@ -127,12 +127,15 @@ pub fn services(runtime: Runtime) -> Runtime {
             let store = LocalBlobStore::new(run_dir.join(BLOBS_DIR));
             caps = caps.provide(OutputStore(Arc::new(store)));
         }
-        let run = stage::RunInfo {
-            run_id: run_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        };
+        let run = caps.get::<stage::RunInfo>().map_or_else(
+            || stage::RunInfo {
+                run_id: run_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
+            |run| (*run).clone(),
+        );
         if let Some(local) = &local {
             local.set_run(run.clone());
             local.set_permission_ceiling(
@@ -141,9 +144,13 @@ pub fn services(runtime: Runtime) -> Runtime {
             );
             local.set_client(caps.get::<pebble::PebbleClient>().map(|c| (*c).clone()));
         }
-        (
+        let caps = if caps.has::<stage::RunInfo>() {
+            caps
+        } else {
             caps.provide(run)
-                .provide(sessions::SessionService::new())
+        };
+        (
+            caps.provide(sessions::SessionService::new())
                 .provide(fallback::FallbackService::new()),
             None,
         )

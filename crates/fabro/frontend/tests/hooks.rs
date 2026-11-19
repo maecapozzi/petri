@@ -15,6 +15,7 @@ use attractor_steps::acp::ENVELOPE_KIND;
 use attractor_steps::agent::THREAD_EVENT;
 use attractor_steps::hooks::{REPORT_EVENT, WARNING_EVENT};
 use attractor_steps::pebble::PebbleClient;
+use attractor_steps::stage::RunInfo;
 use attractor_steps::{
     AGENT_KIND, BranchStep, CommandStep, FanInStep, ForkStep, HumanStep, PROMPT_KIND, StageStep,
     StubStep, WAIT_KIND, WORKFLOW_KIND, register,
@@ -381,7 +382,88 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+async fn run_hook_identity(run_dir: &Path, supplied: Option<RunInfo>) -> (String, Value) {
+    fs::create_dir_all(run_dir).expect("test run directory");
+    let graph = lower(
+        r#"digraph W {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        work [shape=parallelogram, script="true"]
+        start -> work -> exit
+    }"#,
+        r#"
+[[run.hooks]]
+event = "stage_start"
+script = "printf '%s' \"$FABRO_RUN_ID\" > hook-run-id; cp \"$FABRO_HOOK_CONTEXT\" hook-context.json"
+"#,
+    );
+    let mut options = RunOptions::new(run_dir);
+    options.grace = Duration::from_millis(200);
+    options.retention = Retention::Always;
+    let runtime = Runtime::standard().options(options);
+    let runtime = match supplied {
+        Some(run) => runtime.capability(run),
+        None => runtime,
+    };
+    let report = register(runtime)
+        .run(graph)
+        .await
+        .expect("replay is byte-identical");
+    assert_eq!(
+        report.status,
+        RunStatus::Success,
+        "{:?}",
+        report.state.errors()
+    );
+
+    let workspace = run_dir.join("scopes/scope-0/work");
+    (
+        read(&workspace.join("hook-run-id")),
+        serde_json::from_slice(&fs::read(workspace.join("hook-context.json")).expect("context"))
+            .expect("hook context is JSON"),
+    )
+}
+
 // ── Configuration, dispatch, command hooks ──────────────────────────────────
+
+/// A host-owned identity survives Attractor's run services and reaches the
+/// sandbox hook's environment and JSON context, even when storage ends in the
+/// generic `petri` component.
+#[tokio::test]
+async fn a_host_run_identity_reaches_sandbox_hook_environment_and_context() {
+    let dir = RunDir::new("fabro-host-run-identity");
+    let run_dir = dir.path().join("petri");
+    let run_id = "01M7T8TP77ZB5QEGHY77SC5EMR";
+
+    let (environment, context) = run_hook_identity(
+        &run_dir,
+        Some(RunInfo {
+            run_id: run_id.into(),
+        }),
+    )
+    .await;
+
+    assert_eq!(environment, run_id);
+    assert_eq!(context["run_id"], run_id);
+}
+
+/// Without a host capability, standalone runs retain the directory-derived
+/// identity hooks historically received.
+#[tokio::test]
+async fn a_standalone_run_identity_uses_its_run_directory_for_hooks() {
+    let dir = RunDir::new("fabro-standalone-run-identity");
+    let expected = dir
+        .path()
+        .file_name()
+        .expect("test run directory has a name")
+        .to_string_lossy()
+        .into_owned();
+
+    let (environment, context) = run_hook_identity(dir.path(), None).await;
+
+    assert_eq!(environment, expected);
+    assert_eq!(context["run_id"], expected);
+}
 
 /// Every reference phase fires a command hook with Fabro's payload, in the
 /// sandbox by default and on the host when asked; the log the hooks write

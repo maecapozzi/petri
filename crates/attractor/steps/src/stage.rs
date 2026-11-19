@@ -38,8 +38,8 @@ use crate::{checkout, fallback, permissions};
 pub const KIND: StepKindId = STAGE_KIND;
 
 /// The run's identity as hooks see it: `FABRO_RUN_ID` and the `run_id` field
-/// of every hook context. Set by the per-run provisioner from the run
-/// directory's name.
+/// of every hook context. A host can supply it as a runtime capability; the
+/// per-run provisioner otherwise derives it from the run directory's name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunInfo {
     pub run_id: String,
