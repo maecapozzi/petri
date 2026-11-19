@@ -645,6 +645,76 @@ async fn an_idle_run_is_cancelled_by_the_watchdog() {
     );
 }
 
+struct ActivityAfterTimeoutDecision {
+    watchdog: RunWatchdog,
+    observed: AtomicBool,
+}
+
+impl ExecutionObserver for ActivityAfterTimeoutDecision {
+    fn on_engine_record(&self, _: ExecutionId, _: &EventRecord, _: u64, _: &EngineState) {}
+
+    fn on_lifecycle(&self, record: &CoordinatorRecord) {
+        if let CoordinatorEvent::RunTimeoutUpdated { state } = &record.body
+            && state.idle_duration_ms >= 100
+            && !self.observed.swap(true, Ordering::SeqCst)
+        {
+            // The watchdog made its timeout decision before asking the
+            // coordinator to append this checkpoint. Activity here is real,
+            // but it is after that decision's linearization point.
+            self.watchdog.record_activity();
+        }
+    }
+}
+
+/// Activity can race between a timeout decision and its durable checkpoint.
+/// The checkpoint observer provides that controlled ordering: the decision
+/// remains valid and cancellation follows, while the activity resets the next
+/// idle interval rather than retroactively revoking the completed decision.
+#[tokio::test]
+async fn activity_after_the_timeout_decision_does_not_revoke_it() {
+    const IDLE: &str = r#"digraph G {
+        graph [stall_timeout="100ms"]
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        long [shape=parallelogram, script="sleep 20"]
+        start -> long -> exit
+    }"#;
+    let dir = RunDir::new("watchdog-decision-activity-race");
+    let rt = runtime(&dir);
+    let graph = lower(&rt, &dir, IDLE).graph.expect("lowers");
+    let watchdog = RunWatchdog::with_limits(Some(Duration::from_millis(100)), None);
+    let race = Arc::new(ActivityAfterTimeoutDecision {
+        watchdog: watchdog.clone(),
+        observed: AtomicBool::new(false),
+    });
+    let mut task = None;
+    let report = timeout(
+        Duration::from_secs(10),
+        host::run_configured(
+            &rt,
+            HostRun::new(graph)
+                .observe(race.clone())
+                .observe(Arc::new(watchdog.clone())),
+            |handle, _| task = Some(watchdog.start(handle)),
+        ),
+    )
+    .await
+    .expect("the timeout race and cleanup are bounded")
+    .expect("the run completes");
+    task.expect("started").stop().await;
+
+    assert!(
+        race.observed.load(Ordering::SeqCst),
+        "activity was injected from the timeout checkpoint callback"
+    );
+    assert_eq!(report.status, RunStatus::Cancelled);
+    assert!(matches!(
+        watchdog.timeout_reason(),
+        Some(RunTimeout::Stall(timeout))
+            if timeout.stall_timeout_ms == 100 && timeout.idle_ms >= 100
+    ));
+}
+
 struct HeartbeatOnly;
 
 #[async_trait::async_trait]
